@@ -30,3 +30,7 @@ board-sample*.html
 # committing, or leave it here — an untracked file that `git add -A` would
 # sweep into a public repo is exactly the accident this line prevents.
 docs/superpowers/plans/board-plan.md
+
+# Any env file or backup of one (keep only the example tracked)
+.env*
+!.env.example
