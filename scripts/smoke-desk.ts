@@ -68,8 +68,8 @@ try {
 
   const r = await client.callTool({ name: "reply", arguments: { text: "pong" } }) as { content: { text: string }[] };
   if (r.content[0].text !== "sent") throw new Error(`reply returned ${JSON.stringify(r)}`);
-  await wait("reply in topic", () => sent.some((s) => s.thread === 55 && s.text === "pong"));
-  ok("reply reached the topic");
+  await wait("reply in topic", () => sent.some((s) => s.thread === 55 && s.text === "🤖 pong"));
+  ok("reply reached the topic, marked as Claude's");
 
   await (client as unknown as { notification(x: unknown): Promise<void> }).notification({
     method: "notifications/claude/channel/permission_request",

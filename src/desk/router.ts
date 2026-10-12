@@ -9,7 +9,7 @@ import { chmodSync, lstatSync, statSync, unlinkSync } from "node:fs";
 import { dirname } from "node:path";
 import { createHash } from "node:crypto";
 import { ChannelMessage, clip, decode, encode, LineReader, oneLine, VERDICT_TEXT, type DaemonMessage } from "./protocol.js";
-import { CHUNK, cleanText, promptMessages, tooLongText } from "./prompt.js";
+import { CHUNK, cleanText, INVISIBLE, promptMessages, tooLongText } from "./prompt.js";
 import type { DeskLog, DeskSessionRow, DeskState, DeskTelegram, DeskUpdate } from "./types.js";
 
 export const NO_SESSION_TEXT = "No Claude Code session is open for this folder. Start one with `claude-telegram code` there.";
@@ -29,8 +29,35 @@ const MAX_CONNECTIONS = 32;
 const ANSWERED_KEEP = 200;
 const PENDING_KEEP = 50;
 /** Above this many unhandled messages a connection stops being read until it catches up. */
-const BACKLOG_PAUSE = 20;
-const BACKLOG_RESUME = 5;
+const BACKLOG_PAUSE = 8;
+const BACKLOG_RESUME = 2;
+/** Every part of a Claude reply starts with this, and nothing the router writes ever does: the
+ * owner can always tell Claude's words from the router's own messages and prompts. */
+export const REPLY_MARK = "🤖 ";
+/** Fail-closed limits: what one local process or one runaway session can make the router do. */
+export interface DeskLimits {
+  /** Live sessions with a topic, all together. */
+  sessions: number;
+  /** Sessions started (topic created or reopened) per minute, all together. */
+  startsPerMinute: number;
+  /** Topics created per minute, all together. */
+  topicsPerMinute: number;
+  /** Messages one session may post per minute; more wait their turn. */
+  sendsPerMinute: number;
+  /** How long part of a line may wait for the rest (while the router is reading). */
+  partialLineMs: number;
+  /** How often sessions waiting for a topic are tried again. */
+  retryWaitingMs: number;
+  /** Group updates waiting to be handled; past this, new ones are dropped. */
+  queuedUpdates: number;
+}
+export const DEFAULT_LIMITS: DeskLimits = { sessions: 20, startsPerMinute: 10, topicsPerMinute: 5, sendsPerMinute: 20, partialLineMs: 30_000, retryWaitingMs: 20_000, queuedUpdates: 500 };
+/** Size bound for the sets and maps that remember senders, chats and notices. */
+const MEMORY_KEEP = 1000;
+/** Control characters (newlines and tabs stay), direction overrides and invisible characters
+ * come out of replies, so a reply can't reorder or hide what's around it. */
+const REPLY_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g;
+export const replyText = (t: string) => t.replace(REPLY_CONTROL, " ").replace(INVISIBLE, "");
 /** How often the forwarded-message notice may repeat in one topic. */
 const NOTICE_EVERY_MS = 10 * 60_000;
 
@@ -58,6 +85,10 @@ interface Conn {
   /** Open permission prompts: request id → the message with the buttons. */
   pending: Map<string, { messageId: number; text: string }>;
   answered: Set<string>;
+  /** When this connection's last messages were posted (pacing). */
+  sent: number[];
+  /** A topic-failure notice was already posted in General for this session. */
+  noticed: boolean;
 }
 
 export interface DeskRouterOptions {
@@ -75,6 +106,7 @@ export interface DeskRouterOptions {
   helloTimeoutMs?: number;
   /** Wait before retrying a failed topic creation. */
   retryMs?: number;
+  limits?: Partial<DeskLimits>;
 }
 
 /** A topic name: "<folder> · <branch>", "#2" for a second session in the same folder, ≤ 128 chars. */
@@ -133,6 +165,12 @@ export class DeskRouter {
   /** Group updates are handled one at a time, in arrival order. */
   private updates: Promise<void> = Promise.resolve();
   private noticeAt = new Map<string, number>();
+  private queuedUpdates = 0;
+  private starts: number[] = [];
+  private topicsMade: number[] = [];
+  private retryTimer?: NodeJS.Timeout;
+  private limitLogAt = new Map<string, number>();
+  private lim: DeskLimits;
   private tg: DeskTelegram;
   private state: DeskState;
   private log: DeskLog;
@@ -143,6 +181,45 @@ export class DeskRouter {
     this.state = opts.state;
     this.log = opts.log;
     this.alive = opts.alive ?? defaultAlive;
+    this.lim = { ...DEFAULT_LIMITS, ...opts.limits };
+  }
+
+  /** Room in a one-minute window? Takes a slot if so. */
+  private take(window: number[], max: number): boolean {
+    const now = Date.now();
+    while (window.length && now - window[0] >= 60_000) window.shift();
+    if (window.length >= max) return false;
+    window.push(now);
+    return true;
+  }
+
+  /** A limit was hit: log it (at most once a minute per kind) and tell the session. */
+  private refuse(conn: Conn, kind: string, reason: string): void {
+    const now = Date.now();
+    if (now - (this.limitLogAt.get(kind) ?? 0) >= 60_000) { this.limitLogAt.set(kind, now); this.log(`desk: limit reached (${kind}): ${reason}`); }
+    this.write(conn, { type: "error", reason });
+  }
+
+  /** Wait until this session may post again (sendsPerMinute), so one session can't use up the
+   * group's Telegram quota for the others. */
+  private async pace(conn: Conn): Promise<void> {
+    for (;;) {
+      if (this.stopping || conn.ended) throw new Error("session closed while waiting to post");
+      const now = Date.now();
+      while (conn.sent.length && now - conn.sent[0] >= 60_000) conn.sent.shift();
+      if (conn.sent.length < this.lim.sendsPerMinute) { conn.sent.push(now); return; }
+      await new Promise((r) => setTimeout(r, Math.min(1000, 60_000 - (now - conn.sent[0]) + 5)));
+    }
+  }
+
+  /** Sessions waiting for a topic (a limit, a failed topic, or a group change) are tried again. */
+  private retryWaiting(): void {
+    const group = this.state.group();
+    if (!group || this.stopping) return;
+    for (const c of this.conns) {
+      if (!c.hello || c.ended) continue;
+      if (c.sessionId === undefined || this.state.get(c.sessionId)?.group_id !== group) void this.lock(c.hello.cwd, () => this.attach(c));
+    }
   }
 
   // ---- lifecycle ----
@@ -156,6 +233,7 @@ export class DeskRouter {
     if (st.mode & 0o022) throw new Error(`${dir} is writable by other users; not listening there (chmod go-w it)`);
     await this.takeLock(path);
     try { await this.listen(path); } catch (e) { this.lockServer?.close(); this.lockServer = undefined; throw e; }
+    this.retryTimer = setInterval(() => this.retryWaiting(), this.lim.retryWaitingMs).unref();
   }
 
   /** On Linux, an abstract-namespace socket named after this user and socket path: binding it is
@@ -212,6 +290,7 @@ export class DeskRouter {
     if (server) await new Promise<void>((r) => server.close(() => r()));
     this.lockServer?.close();
     this.lockServer = undefined;
+    clearInterval(this.retryTimer);
     try { if (lstatSync(this.opts.socketPath).isSocket()) unlinkSync(this.opts.socketPath); } catch { /* gone */ }
   }
 
@@ -226,16 +305,24 @@ export class DeskRouter {
   // ---- channel connections ----
   private onConnection(sock: Socket): void {
     if (this.stopping || this.conns.size >= MAX_CONNECTIONS) { sock.destroy(); return; }
-    const conn: Conn = { sock, ended: false, superseded: false, queue: Promise.resolve(), backlog: 0, paused: false, pending: new Map(), answered: new Set() };
+    const conn: Conn = { sock, ended: false, superseded: false, queue: Promise.resolve(), backlog: 0, paused: false, pending: new Map(), answered: new Set(), sent: [], noticed: false };
     this.conns.add(conn);
     // A connection that never says hello would hold a slot forever.
     conn.helloTimer = setTimeout(() => { if (!conn.hello) sock.destroy(); }, this.opts.helloTimeoutMs ?? 10_000).unref();
+    // Part of a line may wait for the rest only so long, and only while the router is reading
+    // (a paused socket isn't the peer's fault).
+    let partialTimer: NodeJS.Timeout | undefined;
+    const armPartial = () => {
+      if (reader.partial && !conn.paused) {
+        partialTimer ??= setTimeout(() => { this.log("desk: a channel left a line unfinished; disconnected it"); sock.destroy(); }, this.lim.partialLineMs).unref();
+      } else if (partialTimer) { clearTimeout(partialTimer); partialTimer = undefined; }
+    };
     const enqueue = (fn: () => Promise<void>) => {
       conn.backlog++;
-      if (conn.backlog >= BACKLOG_PAUSE && !conn.paused) { conn.paused = true; sock.pause(); }
+      if (conn.backlog >= BACKLOG_PAUSE && !conn.paused) { conn.paused = true; sock.pause(); armPartial(); }
       conn.queue = conn.queue.then(fn).catch((e) => this.log(`desk: ${errText(e)}`)).finally(() => {
         conn.backlog--;
-        if (conn.paused && conn.backlog <= BACKLOG_RESUME) { conn.paused = false; sock.resume(); }
+        if (conn.paused && conn.backlog <= BACKLOG_RESUME) { conn.paused = false; sock.resume(); armPartial(); }
       });
     };
     const reader = new LineReader((line) => {
@@ -243,12 +330,16 @@ export class DeskRouter {
       enqueue(() => m ? this.handle(conn, m) : Promise.resolve(this.write(conn, { type: "error", reason: "That wasn't a valid desk message." })));
     });
     sock.on("data", (d) => {
-      if (reader.push(d)) return;
-      this.log("desk: a channel sent an oversized line; disconnected it");
-      sock.destroy();
+      if (!reader.push(d)) {
+        this.log("desk: a channel sent an oversized line; disconnected it");
+        sock.destroy();
+        return;
+      }
+      armPartial();
     });
     sock.on("error", () => { /* close follows */ });
     sock.on("close", () => {
+      clearTimeout(partialTimer);
       clearTimeout(conn.helloTimer);
       this.conns.delete(conn);
       enqueue(() => this.onClose(conn));
@@ -284,8 +375,8 @@ export class DeskRouter {
     const row = this.topicOf(conn);
     if (!row) { this.write(conn, { type: "error", reason: this.state.group() ? "This session has no topic yet." : NO_GROUP_REASON }); return; }
     if (m.type === "reply") {
-      // A reply never starts like a permission prompt, so it can't pass for one.
-      const failed = await this.post(row.group_id, row.topic_id, m.text, (p) => p.trimStart().startsWith("🔐") ? `💬 ${p}` : p);
+      // Every part carries the reply mark, whatever Claude wrote: it can't pass for the router.
+      const failed = await this.post(row.group_id, row.topic_id, replyText(m.text), { shape: (p) => REPLY_MARK + p, before: () => this.pace(conn) });
       if (failed) await this.post(row.group_id, row.topic_id, `⚠️ ${failed} part(s) of that reply didn't send.`);
       return;
     }
@@ -302,7 +393,8 @@ export class DeskRouter {
     const text = parts.at(-1)!;
     let mid: number | undefined;
     try {
-      for (const p of parts.slice(0, -1)) await this.tg.send(row.group_id, row.topic_id, p);
+      for (const p of parts.slice(0, -1)) { await this.pace(conn); await this.tg.send(row.group_id, row.topic_id, p); }
+      await this.pace(conn);
       mid = await this.tg.send(row.group_id, row.topic_id, text, buttons);
     } catch (e) { this.log(`desk: couldn't show a permission prompt for session ${row.id}: ${errText(e)}`); }
     if (mid === undefined) {
@@ -345,6 +437,10 @@ export class DeskRouter {
       await this.post(row.group_id, row.topic_id, "Moved to another desk group.");
       await this.tg.closeTopic(row.group_id, row.topic_id).catch(() => undefined);
     }
+    // Limits, checked before anything reaches Telegram. Refused sessions are tried again later.
+    const bound = conn.sessionId !== undefined && this.bySession.get(conn.sessionId) === conn;
+    if (!bound && this.bySession.size >= this.lim.sessions) { this.refuse(conn, "sessions", `There are already ${this.lim.sessions} open desk sessions; this one gets a topic when one of them ends.`); return; }
+    if (!this.take(this.starts, this.lim.startsPerMinute)) { this.refuse(conn, "starts", "Too many sessions started in the last minute; this one gets a topic shortly."); return; }
     // Someone may have joined since /desk_here: check again before a session's text goes there.
     const count = await this.tg.getChatMemberCount(group).catch(() => undefined);
     if (count !== undefined && count > 2) { await this.privacyBreach(group, `the group has ${count} members`); this.write(conn, { type: "error", reason: NO_GROUP_REASON }); return; }
@@ -356,6 +452,11 @@ export class DeskRouter {
       catch (e) { if (notModified(e)) topic = row.topic_id; else this.log(`desk: couldn't reopen topic ${row.topic_id} (${errText(e)}); opening a new one`); }
       if (topic !== undefined && row.topic_name !== name) await this.tg.editTopic(group, topic, name).catch((e) => { if (!notModified(e)) this.log(`desk: couldn't rename topic: ${errText(e)}`); });
     }
+    if (topic === undefined && !this.take(this.topicsMade, this.lim.topicsPerMinute)) {
+      this.state.setOffline(row.id);
+      this.refuse(conn, "topics", "Too many topics created in the last minute; this session gets one shortly.");
+      return;
+    }
     if (topic === undefined) {
       let err: unknown;
       for (let attempt = 0; attempt < 2 && topic === undefined; attempt++) {
@@ -364,7 +465,7 @@ export class DeskRouter {
       }
       if (topic === undefined) {
         this.state.setOffline(row.id);
-        await this.post(group, undefined, `Couldn't open a topic for the session in ${h.cwd}: ${clip(errText(err), 300)}`);
+        if (!conn.noticed) { conn.noticed = true; await this.post(group, undefined, `Couldn't open a topic for the session in ${h.cwd}: ${clip(errText(err), 300)}. It's tried again shortly.`); }
         this.write(conn, { type: "error", reason: `Couldn't open a Telegram topic: ${clip(errText(err), 300)}` });
         return;
       }
@@ -416,13 +517,13 @@ export class DeskRouter {
     this.state.setOffline(id);
   }
 
-  /** Send text to a topic in ≤ CHUNK parts (each part through `shape`, if given). A failed part is
-   * logged and the rest still go. Resolves to how many parts failed. */
-  private async post(chatId: string, threadId: number | undefined, text: string, shape?: (part: string) => string): Promise<number> {
-    const parts = chunkText(text, shape ? CHUNK - 3 : CHUNK);
+  /** Send text to a topic in ≤ CHUNK parts (each part through `shape`, each send after `before`).
+   * A failed part is logged and the rest still go. Resolves to how many parts failed. */
+  private async post(chatId: string, threadId: number | undefined, text: string, o: { shape?: (part: string) => string; before?: () => Promise<void> } = {}): Promise<number> {
+    const parts = chunkText(text, o.shape ? CHUNK - 8 : CHUNK);
     let failed = 0;
     for (const p of parts) {
-      try { await this.tg.send(chatId, threadId, shape ? shape(p) : p); } catch (e) { failed++; this.log(`desk: send failed: ${errText(e)}`); }
+      try { await o.before?.(); await this.tg.send(chatId, threadId, o.shape ? o.shape(p) : p); } catch (e) { failed++; this.log(`desk: send failed: ${errText(e)}`); }
     }
     if (failed) this.log(`desk: ${failed} of ${parts.length} part(s) didn't send`);
     return failed;
@@ -440,13 +541,20 @@ export class DeskRouter {
   /** Every group update the bot's poll loop sees. Updates are handled one at a time in the
    * order they arrive; the returned promise settles when this one is done. Never rejects. */
   onUpdate(u: DeskUpdate): Promise<void> {
-    const run = this.updates.then(() => this.route(u)).catch((e) => this.log(`desk: update failed: ${errText(e)}`));
+    if (this.queuedUpdates >= this.lim.queuedUpdates) {
+      const now = Date.now();
+      if (now - (this.limitLogAt.get("updates") ?? 0) >= 60_000) { this.limitLogAt.set("updates", now); this.log(`desk: limit reached (updates): ${this.lim.queuedUpdates} group updates waiting; dropping new ones`); }
+      return Promise.resolve();
+    }
+    this.queuedUpdates++;
+    const run = this.updates.then(() => this.route(u)).catch((e) => this.log(`desk: update failed: ${errText(e)}`)).finally(() => { this.queuedUpdates--; });
     this.updates = run;
     return run;
   }
 
   private logOnce(set: Set<string>, key: string, message: string): void {
     if (set.has(key)) return;
+    if (set.size >= MEMORY_KEEP) set.clear();
     set.add(key);
     this.log(message);
   }
@@ -475,6 +583,8 @@ export class DeskRouter {
         if (chat !== this.state.group()) return;
         const key = `${chat}:${thread ?? "general"}`;
         if (Date.now() - (this.noticeAt.get(key) ?? 0) < NOTICE_EVERY_MS) return;
+        if (this.noticeAt.size >= MEMORY_KEEP) for (const [k, t] of this.noticeAt) if (Date.now() - t >= NOTICE_EVERY_MS) this.noticeAt.delete(k);
+        if (this.noticeAt.size >= MEMORY_KEEP) this.noticeAt.clear();
         this.noticeAt.set(key, Date.now());
         await this.post(chat, thread, FORWARD_TEXT);
         return;

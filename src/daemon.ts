@@ -84,7 +84,7 @@ export class DeskDaemon {
     if (c.kind === "dm-callback") { void this.tg.answerCallback(c.id).catch(() => undefined); return; }
     if (String(c.fromId) !== this.o.ownerId) {
       const who = String(c.fromId ?? "unknown");
-      if (!this.loggedDm.has(who)) { this.loggedDm.add(who); this.o.log(`claude-telegram: ignored a direct message from user ${who} (only the owner's count)`); }
+      if (!this.loggedDm.has(who)) { if (this.loggedDm.size >= 1000) this.loggedDm.clear(); this.loggedDm.add(who); this.o.log(`claude-telegram: ignored a direct message from user ${who} (only the owner's count)`); }
       return;
     }
     if (!this.state) return;

@@ -1,28 +1,28 @@
 /** How a permission prompt is shown in Telegram. Claude Code's description and input preview
  * are untrusted display text. The input preview is JSON-shaped ({ "key": value, … }), so it is
- * shown field by field, nested fields included, and every field keeps its start and its end;
- * only a long field's middle is hidden. Nothing that can't be shown that way is shown at all:
- * the caller makes such a prompt answerable in the terminal only. */
-import { elideMiddle, headOf, oneLine } from "./protocol.js";
+ * shown field by field, nested fields included, and nothing is ever hidden: every field is shown
+ * in full. A prompt that doesn't fit that way isn't shown at all: the caller makes it
+ * answerable in the terminal only. */
+import { headOf, oneLine } from "./protocol.js";
 
 /** Under Telegram's 4096-character cap per message. */
 export const CHUNK = 4000;
-export const FIELD_HEAD = 600;
-export const FIELD_TAIL = 600;
+/** Longest field shown (after cleaning); Claude Code relays at most 3,500 code points per field. */
+export const MAX_FIELD = 3500;
 const MAX_FIELDS = 40;
 const MAX_LABEL = 80;
 const MAX_TOOL = 200;
-const MAX_MESSAGES = 6;
+export const MAX_MESSAGES = 4;
+/** Claude Code's own mark where it left out the middle of a long field: such a field isn't whole. */
+const CLAUDE_ELIDED = /\u22ef\s*\d+\s+code points elided\s*\u22ef/;
 
 /** Control characters become spaces; direction overrides, zero-width and other invisible
  * characters go, so nothing can reorder or hide what's shown. */
 const CONTROL = /[\u0000-\u001f\u007f-\u009f]/g;
-const INVISIBLE = /[؜​-‏‪-‮⁠-⁩﻿]/g;
+export const INVISIBLE = /[\u061c\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/g;
 export function cleanText(t: string): string {
   return oneLine(t.replace(CONTROL, " ").replace(INVISIBLE, ""));
 }
-
-const elide = (t: string) => elideMiddle(t, FIELD_HEAD, FIELD_TAIL);
 
 interface Field { label: string; value: string }
 
@@ -48,28 +48,31 @@ export function previewFields(preview: string): Field[] | undefined {
   return out;
 }
 
-/** The prompt as messages (the buttons go on the last), or undefined when it can't be shown
- * faithfully: too many or too long fields, an unparseable preview that would need cutting, or
- * more messages than is reasonable. */
+/** The prompt as messages (the buttons go on the last), everything in full; or undefined when it
+ * can't be shown that way: a field (or the description, or an unparseable preview) longer than
+ * MAX_FIELD or already shortened by Claude Code, too many fields, a label too long, or more than
+ * MAX_MESSAGES messages. */
 export function promptMessages(tool: string, description: string, preview: string, requestId: string): string[] | undefined {
   const name = cleanText(tool);
   if (!name || name.length > MAX_TOOL) return undefined;
   const head = `🔐 Permission: ${name}`;
-  const lines = [head, `What: ${elide(cleanText(description)) || "(no description)"}`];
+  const desc = cleanText(description);
+  if (desc.length > MAX_FIELD || CLAUDE_ELIDED.test(desc)) return undefined;
+  const lines = [head, `What: ${desc || "(no description)"}`];
   const fields = previewFields(preview);
   if (fields === undefined) {
     const t = cleanText(preview);
-    if (t) {
-      if (elide(t) !== t) return undefined; // can't tell its fields apart, so can't cut it safely
-      lines.push(`Input: ${t}`);
-    }
+    if (t.length > MAX_FIELD || CLAUDE_ELIDED.test(t)) return undefined;
+    if (t) lines.push(`Input: ${t}`);
   } else {
     if (fields.length > MAX_FIELDS) return undefined;
     if (fields.length) lines.push("Input:");
     for (const f of fields) {
       const label = cleanText(f.label);
       if (label.length > MAX_LABEL) return undefined;
-      lines.push(`• ${label || "(value)"}: ${elide(cleanText(f.value))}`);
+      const value = cleanText(f.value);
+      if (value.length > MAX_FIELD || CLAUDE_ELIDED.test(value)) return undefined;
+      lines.push(`• ${label || "(value)"}: ${value}`);
     }
   }
   const foot = `Tap a button, or reply "yes ${requestId}" or "no ${requestId}".`;

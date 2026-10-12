@@ -12,7 +12,10 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { z } from "zod";
-import { DaemonMessage, decode, encode, LineReader, MAX_TEXT_BYTES, REQUEST_ID, type ChannelMessage } from "./protocol.js";
+import { DaemonMessage, decode, encode, LineReader, MAX_LINE_BYTES, MAX_TEXT_BYTES, REQUEST_ID, type ChannelMessage } from "./protocol.js";
+
+/** Whether a message fits in one protocol line once encoded (JSON escaping can grow text). */
+const fits = (m: ChannelMessage) => Buffer.byteLength(encode(m), "utf8") <= MAX_LINE_BYTES;
 
 export const CHANNEL_NAME = "claude-telegram";
 export const ENV_GUARD = "CLAUDE_TELEGRAM_DESK";
@@ -175,7 +178,7 @@ export async function startDeskChannel(o: { socketPath: string; hello: Hello; tr
     if (req.params.name !== "reply") return fail(`unknown tool: ${req.params.name}`);
     const text = (req.params.arguments as { text?: unknown } | undefined)?.text;
     if (typeof text !== "string" || !text.trim()) return fail("reply needs non-empty text");
-    if (Buffer.byteLength(text, "utf8") > MAX_TEXT_BYTES) return fail(`That's longer than ${MAX_TEXT_BYTES / 1024} KB; send it in parts.`);
+    if (Buffer.byteLength(text, "utf8") > MAX_TEXT_BYTES || !fits({ type: "reply", text })) return fail(`That's too long to send in one piece (${MAX_TEXT_BYTES / 1024} KB at most); send it in parts.`);
     if (link.isConnected && link.lastError) return fail(`Not sent: ${link.lastError}`);
     const r = link.send({ type: "reply", text });
     if (r === "dropped") return fail("Not sent: the claude-telegram daemon isn't reachable and too many messages are already waiting.");
@@ -184,14 +187,15 @@ export async function startDeskChannel(o: { socketPath: string; hello: Hello; tr
   server.setNotificationHandler(PermissionRequest, async ({ params }) => {
     if (!REQUEST_ID.test(params.request_id)) { log(`ignored a permission request with an unexpected id`); return; }
     const tool = params.tool_name || "tool";
+    const whole: ChannelMessage = { type: "permission_request", request_id: params.request_id, tool_name: tool, description: params.description, input_preview: params.input_preview };
     // Never cut a field: what can't be sent whole is sent as too long, answerable in the terminal only.
-    if (Buffer.byteLength(params.description, "utf8") > MAX_TEXT_BYTES || Buffer.byteLength(params.input_preview, "utf8") > MAX_TEXT_BYTES || tool.length > 256) {
+    if (Buffer.byteLength(params.description, "utf8") > MAX_TEXT_BYTES || Buffer.byteLength(params.input_preview, "utf8") > MAX_TEXT_BYTES || tool.length > 256 || !fits(whole)) {
       link.send({ type: "permission_request", request_id: params.request_id, tool_name: tool.slice(0, 200) || "tool", description: "", input_preview: "", too_long: true });
       return;
     }
     open.add(params.request_id);
     if (open.size > OPEN_KEEP) open.delete(open.values().next().value!);
-    link.send({ type: "permission_request", request_id: params.request_id, tool_name: tool, description: params.description, input_preview: params.input_preview });
+    link.send(whole);
   });
 
   await server.connect(o.transport);

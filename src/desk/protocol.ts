@@ -6,8 +6,9 @@ import { z } from "zod";
 
 /** Largest text (UTF-8 bytes) carried by one message. */
 export const MAX_TEXT_BYTES = 64 * 1024;
-/** Largest line accepted. JSON escaping can grow text, so this is a few times MAX_TEXT_BYTES. */
-export const MAX_LINE_BYTES = 512 * 1024;
+/** Largest line accepted. JSON escaping can grow text, so this is a few times MAX_TEXT_BYTES; the
+ * channel checks a message's encoded size against it before sending. */
+export const MAX_LINE_BYTES = 256 * 1024;
 /** Claude Code's permission request ids: five lowercase letters, no 'l'. */
 export const REQUEST_ID = /^[a-km-z]{5}$/;
 /** A typed verdict: "yes abcde" / "no abcde" (from the channels reference). */
@@ -64,6 +65,8 @@ export class LineReader {
     }
     return Buffer.byteLength(this.buf, "utf8") <= this.max;
   }
+  /** Whether part of a line is waiting for the rest. */
+  get partial(): boolean { return this.buf.length > 0; }
 }
 
 /** Text shown on one line: whitespace runs (newlines included) folded to a space. */
