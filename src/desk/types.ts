@@ -30,7 +30,8 @@ export interface DeskTelegram {
  * bot wrote it; edited = an edit of an earlier message; media = has a photo, file, voice… */
 export type DeskUpdate =
   | { kind: "message"; chatId: number; chatType: string; fromId?: number; messageId: number; threadId?: number; isTopic?: boolean; text?: string;
-      forwarded?: boolean; viaBot?: boolean; senderChat?: boolean; fromIsBot?: boolean; edited?: boolean; media?: boolean }
+      forwarded?: boolean; viaBot?: boolean; senderChat?: boolean; fromIsBot?: boolean; edited?: boolean; media?: boolean;
+      /** When Telegram says it was sent (unix seconds). */ date?: number; /** A service message: people joined. */ newMembers?: boolean }
   | { kind: "callback"; id: string; chatId: number; fromId: number; messageId: number; data?: string; text?: string };
 
 /** One folder's topic slot. slot 1 is the folder's own topic; 2, 3… are for extra
@@ -39,6 +40,8 @@ export interface DeskSessionRow {
   id: number; cwd: string; slot: number;
   topic_id: number | null; topic_name: string | null; group_id: string | null;
   status: "live" | "offline"; pid: number | null; title: string | null; branch: string | null;
+  /** When the session now holding this row started (UTC, 'YYYY-MM-DD HH:MM:SS'). */
+  started_at: string | null;
   updated_at: string;
 }
 

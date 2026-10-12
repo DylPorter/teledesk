@@ -140,14 +140,6 @@ const PermissionRequest = z.object({
   params: z.object({ request_id: z.string(), tool_name: z.string(), description: z.string(), input_preview: z.string() }).passthrough(),
 });
 
-/** Cut to at most `bytes` UTF-8 bytes. */
-function fitBytes(s: string, bytes: number): string {
-  if (Buffer.byteLength(s, "utf8") <= bytes) return s;
-  let out = Buffer.from(s, "utf8").subarray(0, bytes - 3).toString("utf8");
-  if (out.endsWith("�")) out = out.slice(0, -1);
-  return `${out}…`;
-}
-
 export interface DeskChannel { server: Server; link: DaemonLink; close(): Promise<void> }
 
 /** Build the MCP server and the daemon link, and connect the server to `transport`. */
@@ -191,10 +183,15 @@ export async function startDeskChannel(o: { socketPath: string; hello: Hello; tr
   });
   server.setNotificationHandler(PermissionRequest, async ({ params }) => {
     if (!REQUEST_ID.test(params.request_id)) { log(`ignored a permission request with an unexpected id`); return; }
+    const tool = params.tool_name || "tool";
+    // Never cut a field: what can't be sent whole is sent as too long, answerable in the terminal only.
+    if (Buffer.byteLength(params.description, "utf8") > MAX_TEXT_BYTES || Buffer.byteLength(params.input_preview, "utf8") > MAX_TEXT_BYTES || tool.length > 256) {
+      link.send({ type: "permission_request", request_id: params.request_id, tool_name: tool.slice(0, 200) || "tool", description: "", input_preview: "", too_long: true });
+      return;
+    }
     open.add(params.request_id);
     if (open.size > OPEN_KEEP) open.delete(open.values().next().value!);
-    const fit = (s: string) => fitBytes(s, MAX_TEXT_BYTES);
-    link.send({ type: "permission_request", request_id: params.request_id, tool_name: params.tool_name.slice(0, 256) || "tool", description: fit(params.description), input_preview: fit(params.input_preview) });
+    link.send({ type: "permission_request", request_id: params.request_id, tool_name: tool, description: params.description, input_preview: params.input_preview });
   });
 
   await server.connect(o.transport);

@@ -6,6 +6,8 @@
 Description=claude-telegram: Claude Code sessions in Telegram topics
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -13,6 +15,9 @@ WorkingDirectory=%h/claude-telegram
 ExecStart=/usr/bin/env node --no-warnings=ExperimentalWarning --import tsx src/index.ts
 Restart=on-failure
 RestartSec=5
+# 78: bad .env or a rejected bot token; restarting won't fix it.
+RestartPreventExitStatus=78
+Environment=TSX_DISABLE_CACHE=1
 # Stopping it doesn't end open sessions: they reconnect when it's back.
 TimeoutStopSec=10
 StandardOutput=journal

@@ -13,12 +13,14 @@ const USAGE = `claude-telegram — your Claude Code sessions in Telegram topics
 The daemon itself runs with \`npm start\` (or the systemd unit).`;
 
 async function code(args: string[]): Promise<number> {
-  const { claudeArgs, interactive, runClaude, writeDeskConfig } = await import("./desk/launcher.js");
+  const { claudeArgs, claudeVersion, interactive, MIN_CLAUDE, olderThan, runClaude, writeDeskConfig } = await import("./desk/launcher.js");
   // -p runs, subcommands, --version…: plain claude, arguments untouched.
   if (!interactive(args)) return runClaude({ args, desk: false });
   const p = deskPaths();
   ensureDataDir(p.dataDir);
   if (!existsSync(p.socket)) process.stderr.write("claude-telegram code: the daemon isn't running; this session gets its topic once it starts.\n");
+  const v = claudeVersion();
+  if (v && olderThan(v, MIN_CLAUDE)) process.stderr.write(`claude-telegram code: Claude Code ${v} is older than ${MIN_CLAUDE}, which cleans and masks the permission prompts it relays. Update it before approving from Telegram.\n`);
   writeDeskConfig(p.mcpConfig, join(REPO_ROOT, "bin", "claude-telegram"), ["desk-channel"]);
   return runClaude({ args: claudeArgs(p.mcpConfig, args), desk: true });
 }
@@ -28,7 +30,9 @@ async function main(): Promise<void> {
   if (cmd === "code") { process.exitCode = await code(args); return; }
   if (cmd === "desk-channel") {
     const { runDeskChannel } = await import("./desk/channel.js");
-    process.exitCode = await runDeskChannel(deskPaths().socket);
+    const p = deskPaths();
+    ensureDataDir(p.dataDir);
+    process.exitCode = await runDeskChannel(p.socket);
     return;
   }
   console.log(USAGE);

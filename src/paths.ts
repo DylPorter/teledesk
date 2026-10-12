@@ -23,9 +23,16 @@ export function deskPaths(env: NodeJS.ProcessEnv = process.env): DeskPaths {
   return { dataDir, socket: join(dataDir, "desk.sock"), db: join(dataDir, "desk.db"), mcpConfig: join(dataDir, "desk-mcp.json") };
 }
 
-/** Create the data folder owner-only, and take group/other access away if it has any. */
+/** Create the data folder owner-only (tightening it if needed) and refuse to use one that another
+ * user owns or could replace: the socket, the MCP config Claude Code runs and the database live here. */
 export function ensureDataDir(dir: string): void {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const st = statSync(dir);
-  if (st.uid === process.getuid?.() && st.mode & 0o077) chmodSync(dir, 0o700);
+  const uid = process.getuid?.();
+  let st = statSync(dir);
+  if (uid !== undefined && st.uid !== uid) throw new Error(`${dir} isn't owned by this user; not using it`);
+  if (st.mode & 0o077) { chmodSync(dir, 0o700); st = statSync(dir); }
+  if (st.mode & 0o022) throw new Error(`${dir} is writable by other users; not using it`);
+  // Its parent: someone else who can write there (without the sticky bit) could swap the folder.
+  const parent = statSync(dirname(dir));
+  if (uid !== undefined && parent.uid !== uid && parent.mode & 0o022 && !(parent.mode & 0o1000)) throw new Error(`${dirname(dir)} is writable by other users; not using a data folder in it`);
 }

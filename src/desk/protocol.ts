@@ -20,7 +20,8 @@ const requestId = z.string().regex(REQUEST_ID);
 export const ChannelMessage = z.discriminatedUnion("type", [
   z.object({ type: z.literal("hello"), cwd: z.string().min(1).max(4096), pid: z.number().int().positive(), title: short(256), branch: short(256).optional() }).strict(),
   z.object({ type: z.literal("reply"), text: text().refine((s) => s.trim().length > 0, "empty") }).strict(),
-  z.object({ type: z.literal("permission_request"), request_id: requestId, tool_name: z.string().min(1).max(256), description: text(), input_preview: text() }).strict(),
+  // too_long: the request was too big to send whole; it's shown as answer-in-the-terminal only.
+  z.object({ type: z.literal("permission_request"), request_id: requestId, tool_name: z.string().min(1).max(256), description: text(), input_preview: text(), too_long: z.literal(true).optional() }).strict(),
   z.object({ type: z.literal("bye") }).strict(),
 ]);
 export type ChannelMessage = z.infer<typeof ChannelMessage>;

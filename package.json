@@ -11,11 +11,11 @@
     "node": ">=22.13"
   },
   "scripts": {
-    "start": "NODE_OPTIONS=--no-warnings=ExperimentalWarning tsx src/index.ts",
-    "dev": "NODE_OPTIONS=--no-warnings=ExperimentalWarning tsx watch src/index.ts",
+    "start": "NODE_OPTIONS=--no-warnings=ExperimentalWarning TSX_DISABLE_CACHE=1 tsx src/index.ts",
+    "dev": "NODE_OPTIONS=--no-warnings=ExperimentalWarning TSX_DISABLE_CACHE=1 tsx watch src/index.ts",
     "typecheck": "tsc --noEmit && tsc --noEmit -p legacy",
     "test": "vitest run",
-    "smoke": "NODE_OPTIONS=--no-warnings=ExperimentalWarning tsx scripts/smoke-desk.ts",
+    "smoke": "NODE_OPTIONS=--no-warnings=ExperimentalWarning TSX_DISABLE_CACHE=1 tsx scripts/smoke-desk.ts",
     "test:legacy": "node --import tsx --test legacy/tests/*.test.ts"
   },
   "dependencies": {

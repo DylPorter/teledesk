@@ -26,11 +26,13 @@ const SCHEMA = `CREATE TABLE IF NOT EXISTS desk_sessions (
   id INTEGER PRIMARY KEY, cwd TEXT NOT NULL, slot INTEGER NOT NULL,
   topic_id INTEGER, topic_name TEXT, group_id TEXT,
   status TEXT NOT NULL DEFAULT 'offline', pid INTEGER, title TEXT, branch TEXT,
-  updated_at TEXT NOT NULL DEFAULT (datetime('now')), UNIQUE(cwd, slot))`;
+  started_at TEXT, updated_at TEXT NOT NULL DEFAULT (datetime('now')), UNIQUE(cwd, slot))`;
 
 export class SqliteDeskState implements DeskState {
   constructor(private db: DatabaseSync, private meta: MetaAccess) {
     db.exec(SCHEMA);
+    const cols = db.prepare("PRAGMA table_info(desk_sessions)").all() as { name: string }[];
+    if (!cols.some((c) => c.name === "started_at")) db.exec("ALTER TABLE desk_sessions ADD COLUMN started_at TEXT");
   }
   group(): string | undefined { return this.meta.get(DESK_GROUP_KEY); }
   setGroup(chatId: string | undefined): void {
@@ -53,11 +55,11 @@ export class SqliteDeskState implements DeskState {
       let id: number;
       if (free) {
         id = free.id;
-        this.db.prepare("UPDATE desk_sessions SET status = 'live', pid = ?, title = ?, branch = ?, updated_at = datetime('now') WHERE id = ?").run(pid, title, branch ?? null, id);
+        this.db.prepare("UPDATE desk_sessions SET status = 'live', pid = ?, title = ?, branch = ?, started_at = datetime('now'), updated_at = datetime('now') WHERE id = ?").run(pid, title, branch ?? null, id);
       } else {
         let slot = 1;
         while (rows.some((r) => r.slot === slot)) slot++;
-        id = Number(this.db.prepare("INSERT INTO desk_sessions (cwd, slot, status, pid, title, branch) VALUES (?, ?, 'live', ?, ?, ?)").run(cwd, slot, pid, title, branch ?? null).lastInsertRowid);
+        id = Number(this.db.prepare("INSERT INTO desk_sessions (cwd, slot, status, pid, title, branch, started_at) VALUES (?, ?, 'live', ?, ?, ?, datetime('now'))").run(cwd, slot, pid, title, branch ?? null).lastInsertRowid);
       }
       this.db.exec("COMMIT");
       return this.get(id)!;

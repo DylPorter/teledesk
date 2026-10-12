@@ -7,7 +7,9 @@
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { chmodSync, lstatSync, statSync, unlinkSync } from "node:fs";
 import { dirname } from "node:path";
-import { ChannelMessage, clip, decode, elideMiddle, encode, LineReader, oneLine, VERDICT_TEXT, type DaemonMessage } from "./protocol.js";
+import { createHash } from "node:crypto";
+import { ChannelMessage, clip, decode, encode, LineReader, oneLine, VERDICT_TEXT, type DaemonMessage } from "./protocol.js";
+import { CHUNK, cleanText, promptMessages, tooLongText } from "./prompt.js";
 import type { DeskLog, DeskSessionRow, DeskState, DeskTelegram, DeskUpdate } from "./types.js";
 
 export const NO_SESSION_TEXT = "No Claude Code session is open for this folder. Start one with `claude-telegram code` there.";
@@ -18,8 +20,11 @@ export const FORWARD_TEXT = "Forwarded messages aren't passed to the session. Pa
 export const TEXT_ONLY = "Only text messages reach the session for now.";
 export const EARLIER_SESSION = "This prompt belongs to an earlier session.";
 export const NO_PROMPT = "No open prompt with that code in this session.";
-/** Under Telegram's 4096-character cap per message. */
-export const CHUNK = 4000;
+export { CHUNK, promptMessages, tooLongText };
+export const BEFORE_SESSION = "That message was sent before this session started, so it wasn't passed on.";
+export const PRIVACY_OFF = "Someone besides you and the bot is in this group now, so desk is off here: they could read your sessions. Remove them, then send /desk_here again.";
+/** Telegram's clock vs ours: messages up to this much older than a session's start still count. */
+const CLOCK_SLACK_MS = 60_000;
 const MAX_CONNECTIONS = 32;
 const ANSWERED_KEEP = 200;
 const PENDING_KEEP = 50;
@@ -68,6 +73,8 @@ export interface DeskRouterOptions {
   graceMs?: number;
   /** How long a new connection has to say hello. */
   helloTimeoutMs?: number;
+  /** Wait before retrying a failed topic creation. */
+  retryMs?: number;
 }
 
 /** A topic name: "<folder> · <branch>", "#2" for a second session in the same folder, ≤ 128 chars. */
@@ -95,21 +102,6 @@ export function chunkText(text: string, size = CHUNK): string[] {
   return parts;
 }
 
-/** A permission prompt as one or two messages; the buttons go on the last. Claude Code's
- * description and input preview are untrusted display text: folded to one line each, behind
- * labels, so they can't pose as a verdict or our words. A long one keeps its start and its end
- * (the middle is hidden), so the end of a padded command always shows. */
-export function promptMessages(tool: string, description: string, preview: string, requestId: string): string[] {
-  const head = `🔐 Permission: ${clip(oneLine(tool), 100)}`;
-  const what = `What: ${elideMiddle(oneLine(description)) || "(no description)"}`;
-  const input = oneLine(preview);
-  const inputLine = input ? `Input: ${elideMiddle(input)}` : "";
-  const foot = `Tap a button, or reply "yes ${requestId}" or "no ${requestId}".`;
-  const one = `${head}\n${what}${inputLine ? `\n${inputLine}` : ""}\n\n${foot}`;
-  if (one.length <= CHUNK) return [one];
-  return [`${head}\n${what}`, `${head}\n${inputLine}\n\n${foot}`];
-}
-
 /** Whether something is accepting connections on a unix socket. */
 function answers(path: string): Promise<boolean> {
   return new Promise((resolve) => {
@@ -129,6 +121,8 @@ const notModified = (e: unknown) => /TOPIC_NOT_MODIFIED|not modified/i.test(errT
 
 export class DeskRouter {
   private server?: Server;
+  /** Held while this router runs (Linux): a second one for the same socket can't start at all. */
+  private lockServer?: Server;
   private conns = new Set<Conn>();
   private bySession = new Map<number, Conn>();
   private stopping = false;
@@ -160,6 +154,22 @@ export class DeskRouter {
     const uid = process.getuid?.();
     if (uid !== undefined && st.uid !== uid) throw new Error(`${dir} isn't owned by this user; not listening there`);
     if (st.mode & 0o022) throw new Error(`${dir} is writable by other users; not listening there (chmod go-w it)`);
+    await this.takeLock(path);
+    try { await this.listen(path); } catch (e) { this.lockServer?.close(); this.lockServer = undefined; throw e; }
+  }
+
+  /** On Linux, an abstract-namespace socket named after this user and socket path: binding it is
+   * atomic and the kernel releases it when the process exits, so two routers can't both start. */
+  private async takeLock(path: string): Promise<void> {
+    if (process.platform !== "linux") return;
+    const name = `\0claude-desk-${createHash("sha256").update(`${process.getuid?.()}:${path}`).digest("hex").slice(0, 32)}`;
+    const lock = createServer((s) => s.destroy());
+    await new Promise<void>((resolve, reject) => { lock.once("error", reject); lock.listen(name, () => resolve()); })
+      .catch((e: NodeJS.ErrnoException) => { throw e.code === "EADDRINUSE" ? new Error(`another desk router is already running for ${path}`) : e; });
+    this.lockServer = lock;
+  }
+
+  private async listen(path: string): Promise<void> {
     let existing;
     try { existing = lstatSync(path); } catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; }
     if (existing && !existing.isSocket()) throw new Error(`${path} exists and isn't a socket; not touching it`);
@@ -200,6 +210,8 @@ export class DeskRouter {
     for (const c of this.conns) { clearTimeout(c.helloTimer); c.sock.destroy(); }
     const server = this.server;
     if (server) await new Promise<void>((r) => server.close(() => r()));
+    this.lockServer?.close();
+    this.lockServer = undefined;
     try { if (lstatSync(this.opts.socketPath).isSocket()) unlinkSync(this.opts.socketPath); } catch { /* gone */ }
   }
 
@@ -271,7 +283,12 @@ export class DeskRouter {
     }
     const row = this.topicOf(conn);
     if (!row) { this.write(conn, { type: "error", reason: this.state.group() ? "This session has no topic yet." : NO_GROUP_REASON }); return; }
-    if (m.type === "reply") { await this.post(row.group_id, row.topic_id, m.text); return; }
+    if (m.type === "reply") {
+      // A reply never starts like a permission prompt, so it can't pass for one.
+      const failed = await this.post(row.group_id, row.topic_id, m.text, (p) => p.trimStart().startsWith("🔐") ? `💬 ${p}` : p);
+      if (failed) await this.post(row.group_id, row.topic_id, `⚠️ ${failed} part(s) of that reply didn't send.`);
+      return;
+    }
     await this.prompt(conn, row, m);
   }
 
@@ -279,7 +296,8 @@ export class DeskRouter {
    * It becomes answerable from Telegram only once every part of it has been shown. If any part
    * fails, the owner is told to answer in the terminal, and no answer from here is accepted. */
   private async prompt(conn: Conn, row: DeskSessionRow & { group_id: string; topic_id: number }, m: Extract<ChannelMessage, { type: "permission_request" }>): Promise<void> {
-    const parts = promptMessages(m.tool_name, m.description, m.input_preview, m.request_id);
+    const parts = m.too_long ? undefined : promptMessages(m.tool_name, m.description, m.input_preview, m.request_id);
+    if (!parts) { await this.post(row.group_id, row.topic_id, tooLongText(m.tool_name)); return; }
     const buttons = [[{ text: "Allow", data: permissionData(row.id, conn.hello!.pid, m.request_id, true) }, { text: "Deny", data: permissionData(row.id, conn.hello!.pid, m.request_id, false) }]];
     const text = parts.at(-1)!;
     let mid: number | undefined;
@@ -288,7 +306,7 @@ export class DeskRouter {
       mid = await this.tg.send(row.group_id, row.topic_id, text, buttons);
     } catch (e) { this.log(`desk: couldn't show a permission prompt for session ${row.id}: ${errText(e)}`); }
     if (mid === undefined) {
-      await this.post(row.group_id, row.topic_id, `🔐 Claude is asking to use ${clip(oneLine(m.tool_name), 100)}, but the prompt couldn't be shown here. Answer it in the terminal.`);
+      await this.post(row.group_id, row.topic_id, `🔐 Claude is asking to use ${clip(cleanText(m.tool_name), 100)}, but the prompt couldn't be shown here. Answer it in the terminal.`);
       return;
     }
     conn.pending.set(m.request_id, { messageId: mid, text });
@@ -327,6 +345,9 @@ export class DeskRouter {
       await this.post(row.group_id, row.topic_id, "Moved to another desk group.");
       await this.tg.closeTopic(row.group_id, row.topic_id).catch(() => undefined);
     }
+    // Someone may have joined since /desk_here: check again before a session's text goes there.
+    const count = await this.tg.getChatMemberCount(group).catch(() => undefined);
+    if (count !== undefined && count > 2) { await this.privacyBreach(group, `the group has ${count} members`); this.write(conn, { type: "error", reason: NO_GROUP_REASON }); return; }
     row ??= this.state.claim(h.cwd, h.pid, h.title, h.branch);
     const name = topicName(h.title, h.branch, row.slot);
     let topic: number | undefined;
@@ -336,11 +357,15 @@ export class DeskRouter {
       if (topic !== undefined && row.topic_name !== name) await this.tg.editTopic(group, topic, name).catch((e) => { if (!notModified(e)) this.log(`desk: couldn't rename topic: ${errText(e)}`); });
     }
     if (topic === undefined) {
-      try { topic = await this.tg.createTopic(group, name); }
-      catch (e) {
-        this.log(`desk: couldn't create a topic: ${errText(e)}`);
+      let err: unknown;
+      for (let attempt = 0; attempt < 2 && topic === undefined; attempt++) {
+        if (attempt) await new Promise((r) => setTimeout(r, this.opts.retryMs ?? 3000));
+        try { topic = await this.tg.createTopic(group, name); } catch (e) { err = e; this.log(`desk: couldn't create a topic: ${errText(e)}`); }
+      }
+      if (topic === undefined) {
         this.state.setOffline(row.id);
-        this.write(conn, { type: "error", reason: `Couldn't open a Telegram topic: ${clip(errText(e), 300)}` });
+        await this.post(group, undefined, `Couldn't open a topic for the session in ${h.cwd}: ${clip(errText(err), 300)}`);
+        this.write(conn, { type: "error", reason: `Couldn't open a Telegram topic: ${clip(errText(err), 300)}` });
         return;
       }
     }
@@ -391,14 +416,24 @@ export class DeskRouter {
     this.state.setOffline(id);
   }
 
-  /** Send text to a topic in ≤ CHUNK parts. A failed part is logged and the rest still go. */
-  private async post(chatId: string, threadId: number | undefined, text: string): Promise<void> {
-    const parts = chunkText(text);
+  /** Send text to a topic in ≤ CHUNK parts (each part through `shape`, if given). A failed part is
+   * logged and the rest still go. Resolves to how many parts failed. */
+  private async post(chatId: string, threadId: number | undefined, text: string, shape?: (part: string) => string): Promise<number> {
+    const parts = chunkText(text, shape ? CHUNK - 3 : CHUNK);
     let failed = 0;
     for (const p of parts) {
-      try { await this.tg.send(chatId, threadId, p); } catch (e) { failed++; this.log(`desk: send failed: ${errText(e)}`); }
+      try { await this.tg.send(chatId, threadId, shape ? shape(p) : p); } catch (e) { failed++; this.log(`desk: send failed: ${errText(e)}`); }
     }
     if (failed) this.log(`desk: ${failed} of ${parts.length} part(s) didn't send`);
+    return failed;
+  }
+
+  /** Someone else can see the desk group: stop using it until the owner sets it up again. */
+  private async privacyBreach(chat: string, why: string): Promise<void> {
+    if (this.state.group() !== chat) return;
+    this.state.setGroup(undefined);
+    this.log(`desk: turned desk off in ${chat}: ${why}`);
+    await this.post(chat, undefined, PRIVACY_OFF);
   }
 
   // ---- Telegram updates from groups ----
@@ -417,13 +452,20 @@ export class DeskRouter {
   }
 
   private async route(u: DeskUpdate): Promise<void> {
+    const chat = String(u.chatId);
     if (String(u.fromId) !== this.opts.ownerId) {
       if (u.kind === "callback") await this.tg.answerCallback(u.id).catch(() => undefined);
       const who = String(u.fromId ?? "unknown");
       this.logOnce(this.loggedSenders, who, `desk: ignored a group update from user ${who} (only the owner's count)`);
+      // Never relayed, but it means someone else can read the desk group.
+      if (chat === this.state.group()) await this.privacyBreach(chat, `a message from user ${who}`);
       return;
     }
-    const chat = String(u.chatId);
+    if (u.kind === "message" && u.newMembers && chat === this.state.group()) {
+      const count = await this.tg.getChatMemberCount(chat).catch(() => 3);
+      if (count > 2) await this.privacyBreach(chat, `the group has ${count} members`);
+      return;
+    }
     if (u.kind === "message") {
       // The owner's account, but not the owner's words, or not as themselves: never relayed.
       if (u.senderChat || u.fromIsBot) { this.logOnce(this.loggedSenders, `as-chat:${chat}`, `desk: ignored a message posted as a chat or by a bot in ${chat}`); return; }
@@ -469,6 +511,9 @@ export class DeskRouter {
       await this.post(chat, thread, row?.status === "live" ? RECONNECTING_TEXT : NO_SESSION_TEXT);
       return;
     }
+    // A message from before this session started was meant for an earlier one (delivered late).
+    const started = row.started_at ? Date.parse(`${row.started_at.replace(" ", "T")}Z`) : NaN;
+    if (u.date !== undefined && u.date * 1000 < started - CLOCK_SLACK_MS) { await this.post(chat, thread, BEFORE_SESSION); return; }
     const v = VERDICT_TEXT.exec(text);
     if (v) { await this.verdict(row.id, v[2].toLowerCase(), v[1].toLowerCase().startsWith("y"), { threadId: thread }); return; }
     this.write(conn, { type: "message", text, message_id: u.messageId });
@@ -530,9 +575,8 @@ export class DeskRouter {
     this.state.setGroup(chatId);
     this.log(`desk: group ${chatId} is now the desk group`);
     await this.post(chatId, threadId, "✅ This is the desk group now. Each `claude-telegram code` session gets its own topic here.");
-    for (const c of this.conns) {
-      if (!c.hello || c.ended) continue;
-      if (c.sessionId === undefined || this.state.get(c.sessionId)?.group_id !== chatId) void this.lock(c.hello.cwd, () => this.attach(c));
-    }
+    // Every live session: a new topic if it was elsewhere, otherwise a fresh welcome, which also
+    // clears an error a session got while desk was off.
+    for (const c of this.conns) if (c.hello && !c.ended) void this.lock(c.hello.cwd, () => this.attach(c));
   }
 }

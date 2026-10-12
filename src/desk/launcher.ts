@@ -2,7 +2,8 @@
  * loaded. Custom channels aren't on the research-preview allowlist, so it's loaded
  * with --dangerously-load-development-channels (Claude Code asks to confirm), from an
  * MCP config passed with --mcp-config. */
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { renameSync, writeFileSync } from "node:fs";
 import { constants } from "node:os";
 import { CHANNEL_NAME, ENV_GUARD } from "./channel.js";
@@ -43,9 +44,26 @@ export function interactive(args: string[]): boolean {
 }
 
 export function writeDeskConfig(file: string, command: string, args: string[]): void {
-  const tmp = `${file}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify(deskMcpConfig(command, args), null, 2) + "\n", { mode: 0o600 });
+  // A fresh name, created exclusively: never written through something already there.
+  const tmp = `${file}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+  writeFileSync(tmp, JSON.stringify(deskMcpConfig(command, args), null, 2) + "\n", { mode: 0o600, flag: "wx" });
   renameSync(tmp, file);
+}
+
+/** Claude Code cleans and masks what it relays to channels from this version on. */
+export const MIN_CLAUDE = "2.1.234";
+
+/** Whether version a (e.g. "2.1.296") is older than b. */
+export function olderThan(a: string, b: string): boolean {
+  const pa = a.split(".").map(Number), pb = b.split(".").map(Number);
+  for (let i = 0; i < 3; i++) if ((pa[i] ?? 0) !== (pb[i] ?? 0)) return (pa[i] ?? 0) < (pb[i] ?? 0);
+  return false;
+}
+
+/** The installed claude's version, if it can be read quickly. */
+export function claudeVersion(claude = "claude"): string | undefined {
+  try { return /(\d+\.\d+\.\d+)/.exec(execFileSync(claude, ["--version"], { encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"] }))?.[1]; }
+  catch { return undefined; }
 }
 
 /** Run claude in this terminal and return its exit code. With `desk: false`, plain claude

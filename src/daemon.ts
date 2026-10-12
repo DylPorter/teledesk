@@ -20,6 +20,8 @@ export interface DaemonOptions {
   poller?: { run(onUpdate: (u: RawUpdate) => void, signal: AbortSignal): Promise<void> };
   alive?: (pid: number) => boolean;
   graceMs?: number;
+  /** Polling can't continue (Telegram rejected the token). */
+  onFatal?: (e: Error) => void;
 }
 
 export function helpText(state: DeskState): string {
@@ -59,7 +61,7 @@ export class DeskDaemon {
 
   async start(): Promise<void> {
     const { paths, log } = this.o;
-    ensureDataDir(paths.dataDir);
+    ensureDataDir(paths.dataDir); // throws if the folder isn't safe, before anything is opened in it
     this.db = new DatabaseSync(paths.db);
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;");
     this.state = new SqliteDeskState(this.db, sqliteMeta(this.db));
@@ -67,7 +69,10 @@ export class DeskDaemon {
     try { await this.router.start(); }
     catch (e) { this.db.close(); this.db = undefined; throw e; }
     const poller = this.o.poller ?? new Poller(this.o.token!, log);
-    this.polling = poller.run((u) => this.onUpdate(u), this.abort.signal);
+    this.polling = poller.run((u) => this.onUpdate(u), this.abort.signal).catch((e: Error) => {
+      log(`claude-telegram: polling stopped: ${e.message}`);
+      this.o.onFatal?.(e);
+    });
     log(`claude-telegram: listening on ${paths.socket}`);
   }
 

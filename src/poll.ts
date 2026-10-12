@@ -27,6 +27,8 @@ export function groupMessage(m: RawMessage, edited = false): DeskUpdate {
     forwarded: FORWARD_KEYS.some((k) => m[k] !== undefined && m[k] !== false), viaBot: m.via_bot !== undefined,
     senderChat: m.sender_chat !== undefined, fromIsBot: m.from?.is_bot === true,
     edited: edited || m.edit_date !== undefined, media: MEDIA_KEYS.some((k) => m[k] !== undefined),
+    date: typeof m.date === "number" ? m.date : undefined,
+    newMembers: Array.isArray(m.new_chat_members) && m.new_chat_members.length > 0,
   };
 }
 
@@ -51,7 +53,11 @@ const sleep = (ms: number, signal: AbortSignal) => new Promise<void>((r) => {
   signal.addEventListener("abort", () => { clearTimeout(t); r(); }, { once: true });
 });
 
-/** Long-polls getUpdates and hands each update over without waiting on it. */
+/** Telegram refused the token (401/404): retrying won't help, so the daemon exits. */
+export class TokenRejected extends Error {}
+
+/** Long-polls getUpdates and hands each update over without waiting on it. Resolves when
+ * stopped; rejects with TokenRejected when Telegram won't accept the token. */
 export class Poller {
   private offset = 0;
   constructor(private token: string, private log: (m: string) => void, private fetchImpl: typeof fetch = (...a) => fetch(...a)) {}
@@ -65,6 +71,7 @@ export class Poller {
           signal: AbortSignal.any([signal, AbortSignal.timeout(45_000)]),
         });
         const json = await res.json() as { ok: boolean; result?: RawUpdate[]; description?: string; error_code?: number };
+        if (!json.ok && (json.error_code === 401 || json.error_code === 404)) throw new TokenRejected(`telegram rejected the bot token (${json.error_code}: ${json.description ?? "no description"})`);
         if (!json.ok) {
           this.log(json.error_code === 409
             ? "telegram: another program is polling this bot's updates (409). Stop it: one bot token, one poller."
@@ -77,6 +84,7 @@ export class Poller {
           try { onUpdate(u); } catch (e) { this.log(`telegram: update ${u.update_id} failed: ${(e as Error).message}`); }
         }
       } catch (e) {
+        if (e instanceof TokenRejected) throw e;
         if (signal.aborted) return;
         this.log(`telegram: poll error: ${(e as Error).message}`);
         await sleep(5000, signal);
