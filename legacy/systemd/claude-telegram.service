@@ -1,0 +1,16 @@
+[Unit]
+Description=Claude Code Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/claude-telegram
+ExecStart=/usr/bin/npx tsx legacy/src/index.ts
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

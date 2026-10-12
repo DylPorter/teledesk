@@ -1,17 +1,25 @@
 {
   "name": "claude-telegram",
   "version": "0.1.0",
-  "description": "Telegram bot wrapper for Claude Code \u2014 chat with your vault from anywhere",
+  "description": "Your Claude Code sessions in Telegram topics",
   "private": true,
   "type": "module",
+  "bin": {
+    "claude-telegram": "bin/claude-telegram"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
   "scripts": {
-    "dev": "tsx watch src/index.ts",
-    "start": "tsx src/index.ts",
-    "build": "tsc",
-    "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test tests/*.test.ts"
+    "start": "NODE_OPTIONS=--no-warnings=ExperimentalWarning tsx src/index.ts",
+    "dev": "NODE_OPTIONS=--no-warnings=ExperimentalWarning tsx watch src/index.ts",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p legacy",
+    "test": "vitest run",
+    "smoke": "NODE_OPTIONS=--no-warnings=ExperimentalWarning tsx scripts/smoke-desk.ts",
+    "test:legacy": "node --import tsx --test legacy/tests/*.test.ts"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
     "dotenv": "^17.0.0",
     "grammy": "^1.38.0",
     "zod": "^4.0.0"
@@ -19,6 +27,8 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "tsx": "^4.20.0",
-    "typescript": "^5.7.0"
+    "typescript": "^5.7.0",
+    "vite": "^8.3.4",
+    "vitest": "^5.0.3"
   }
 }

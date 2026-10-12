@@ -1,7 +1,7 @@
 /**
  * Live smoke test for the tmux bridge. Manual: spends a few cheap haiku turns.
  *
- *   npx tsx scripts/smoke-bridge.ts
+ *   npx tsx legacy/scripts/smoke-bridge.ts
  *
  * Runs entirely on an ISOLATED tmux server (`tmux -L bridgetest`) with a
  * throwaway `claude` in a temp dir. It never lists, reads or types into panes

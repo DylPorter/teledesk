@@ -1,212 +1,96 @@
 # claude-telegram
 
-Chat with [Claude Code](https://docs.anthropic.com/en/docs/claude-code) from your phone via Telegram. Uses your **Max plan** auth — no API key, no per-token costs.
-
-I built this because the most useful AI assistant in my life lives in my terminal on my laptop, and I'm not always at my laptop. Bridging it to Telegram (running locally as a systemd service) gives me a "second brain in my pocket" without paying API rates on top of the Max subscription I already have.
+**Your Claude Code sessions in Telegram topics.** Start Claude Code with `claude-telegram code` and that session gets its own topic in a private Telegram group. To talk to it from your phone, write in the topic. Its replies come back in the topic, and its permission prompts show up there with **Allow** and **Deny** buttons. No commands to learn: each topic is one session, like a chat list.
 
 ```
-Telegram (phone)
-    ↓
-Linux box runs the bot (systemd service)
-    ↓
-Bot spawns `claude -p --resume <id>` per message
-    ↓
-Claude Code with full tools, your memory, your CLAUDE.md
-    ↓
-Responses streamed back as Telegram messages
+your terminal                          your phone
+claude-telegram code  ──┐
+  (Claude Code + channel │  unix socket   ┌──────────────┐   Telegram   ┌──────────────────────┐
+   server, one per       ├──────────────▶ │ claude-      │ ◀──────────▶ │ group with Topics:   │
+   session)              │                │ telegram     │   one bot    │  • api · main        │
+claude-telegram code  ──┘                 │ daemon       │              │  • web · fix-login   │
+                                          └──────────────┘              └──────────────────────┘
 ```
 
-## Features
+It uses Claude Code [channels](https://code.claude.com/docs/en/channels-reference). Each session loads a small stdio MCP server (`claude-telegram desk-channel`), which connects to the daemon over a local socket. The daemon owns the bot, creates and reuses the topics, and relays messages, replies and permission prompts. It never types into your terminal and never scrapes the screen.
 
-- **Real Claude Code, not an API wrapper.** Your `~/.claude/CLAUDE.md`, your memory, your MCP servers, your skills — all of it works exactly like it does on the desktop.
-- **Per-cycle streaming UX.** Each Claude "thinking cycle" sends a `💭 thinking…` placeholder that gets edited *once* into its actual text. When you stop seeing `thinking…` messages, you know it's finished. No rolling edits, no overwrite races, no duplicated content.
-- **Tunable model + effort** per env var or per message. Default is `sonnet` + `low` effort (snappy capture from the phone); `/deep` upgrades a single turn to `opus + high` for harder work; `/run` lets you point one turn at a different working directory entirely.
-- **Voice notes** are saved to disk; for *dictating to* the bot, use your phone's native voice-to-text (faster than rolling your own transcription).
-- **Photos and files** (single or an album) save to your attachments directory and reach Claude as one prompt listing every file. Put the instruction in the caption; uploads sent without a caption are attached to your next text message (within 10 minutes).
-- **Auth-gated to a single Telegram user ID.** The bot ignores everyone else.
-
-## Why not just use the Claude app on mobile?
-
-Different shape of problem. The Claude mobile app is for chatting with Claude. This bot is for instructing Claude *Code* — your actual tools, your actual filesystem, your actual workflows. It can edit files on your laptop, run commands, hit your MCP servers. The Claude mobile app can't do any of that.
+> **Research preview.** Channels are a Claude Code research preview, and custom channels aren't on its allowlist. So `claude-telegram code` loads this one with `--dangerously-load-development-channels`. Claude Code then shows **"WARNING: Loading development channels"** at every start, and you confirm with *I am using this for local development*. Channels only work in interactive sessions (not `-p`, not the Agent SDK). The protocol may change.
 
 ## Setup
 
-### 1. Create a Telegram bot
+1. **Make a bot.** Create a new bot with [@BotFather](https://t.me/BotFather). Give it to this program alone: only one program can poll a bot token.
+2. **Configure.** `npm install`, then create `.env` in the repo folder:
+   ```
+   TELEGRAM_BOT_TOKEN=123456:ABC...
+   TELEGRAM_ALLOWED_USER_ID=<your numeric Telegram user id; @userinfobot tells you>
+   ```
+3. **Start the daemon.** Run `npm start`, or install `systemd/claude-telegram.service` as a user unit (set its `WorkingDirectory` to your clone).
+4. **Make the desk group** in Telegram:
+   - Create a group with **just you and the bot**, and turn on **Topics** in its settings.
+   - Make the bot an **admin** with the **Manage topics** right. Being an admin also lets it see ordinary messages.
+   - Don't post as the group ("Remain anonymous"); those messages are ignored.
+   - Send **`/desk_here`** in the group. The bot either confirms or tells you what's missing. `/desk_off` turns it off again.
+5. **Start sessions.** Put `bin/` on your PATH (or symlink `bin/claude-telegram`), then run `claude-telegram code` in any folder, with any `claude` arguments after it.
+   - A topic named `<folder> · <branch>` appears.
+   - A second session in the same folder gets `#2`.
+   - The same folder later gets its topic back.
+   - Optional: `alias claude='claude-telegram code'`. Non-interactive runs (`-p`, `--output-format`, `--version`, `mcp …`, `update` and the other subcommands) are passed straight to plain `claude` without the channel.
 
-1. Message [@BotFather](https://t.me/BotFather) on Telegram.
-2. `/newbot` → pick a name and handle.
-3. Save the bot token.
+Message the bot directly for a short help text and the list of live sessions.
 
-### 2. Get your Telegram user ID
+## What happens where
 
-1. Message [@userinfobot](https://t.me/userinfobot).
-2. Note your numeric ID.
-
-### 3. Install
-
-```bash
-git clone https://github.com/DylPorter/claude-telegram.git ~/Documents/Programming/claude-telegram
-cd ~/Documents/Programming/claude-telegram
-npm install
-```
-
-### 4. Configure
-
-```bash
-cp .env.example .env
-$EDITOR .env   # paste your bot token and user ID
-```
-
-Make sure Claude Code is already installed and authenticated on this machine (`claude auth login`). The bot inherits your existing Max-plan login.
-
-### 5. Try it (dev)
-
-```bash
-npm run dev
-```
-
-Send your bot a message from Telegram. You should see a `💭 thinking…` reply within a few seconds, edited to the actual response shortly after.
-
-### 6. Run as a service
-
-```bash
-mkdir -p ~/.config/systemd/user
-cp systemd/claude-telegram.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now claude-telegram.service
-systemctl --user status claude-telegram.service
-```
-
-Logs:
-
-```bash
-journalctl --user -u claude-telegram.service -f
-```
-
-## Slash commands
-
-| Command | What it does |
+| You do | What happens |
 |---|---|
-| `/start` | Greeting + command list |
-| `/reset` | Start a fresh Claude session (clears resume id) |
-| `/status` | Show current session id + working dir |
-| `/cd <abs-path>` | Switch the chat's working dir (starts a fresh session there) |
-| `/vault` | Switch to your default working dir (the `DEFAULT_CWD` env value) |
-| `/deep <prompt>` | Run *this turn only* at `opus + high` effort. Same chat session continues. |
-| `/run <abs-path> [low\|med\|high\|xhigh\|max] <prompt>` | One-off: opus + chosen effort, in a different cwd, fresh ephemeral session. Doesn't touch your main chat state. |
+| Write in a session's topic | It reaches that session only, as `<channel source="claude-telegram" message_id="…">` |
+| Claude calls the `reply` tool | The text appears in the topic, split into parts if it's long. The tool is pre-allowed, so no prompt for it |
+| Claude wants to run a tool that needs approval | The prompt appears in the topic: the tool, what it does, and its input. If the input is long, you see its start and its end with the middle hidden, so the end of a command is never cut off. The terminal dialog stays open too, and whichever answer comes first wins |
+| Tap Allow / Deny, or type `yes abcde` / `no abcde` | The answer goes to that session. Tapping a second time does nothing |
+| Close the session | The topic says "Session ended" and closes |
+| Restart the daemon | Sessions reconnect by themselves and keep their topics |
 
-Anything that isn't a slash command is processed as a regular message.
+## Security model
 
-### Live sessions (tmux bridge)
+- **Who can drive a session.** Only messages whose sender is `TELEGRAM_ALLOWED_USER_ID` reach a session. The check is on the sender's user id, not the chat id.
+- **What's never passed on.** Forwarded messages, messages sent through an inline bot, posts made as the group or a channel, messages from bots, and edits are never passed to a session. Treat whoever controls your Telegram account as someone who can drive your Claude Code sessions.
+- **When an answer counts.** A permission answer from Telegram is accepted only for a prompt that session raised and that was shown in full in its topic. A tap also has to come from that very message.
+  - If a prompt couldn't be shown, Telegram says to answer in the terminal, and nothing typed or tapped in Telegram can answer it.
+  - After a daemon restart, old buttons stop working.
+  - The channel server also drops any answer for a request its own session didn't make.
+- **Which group.** `/desk_here` refuses a public group, and a group with anyone besides you and the bot. Anyone in the group could read your replies and permission previews. Claude Code masks recognisable secrets in those previews, but not all of them.
+- **What's sent as text.** Prompt descriptions and previews are shown as plain text on labelled lines. Nothing is sent with Telegram formatting.
+- **The socket.** It lives at `$XDG_DATA_HOME/claude-telegram/desk.sock` (default `~/.local/share/claude-telegram/`). The folder is 0700 and the socket 0600. The daemon won't listen in a folder others can write to, and the channel server only connects to a socket owned by your user. `CLAUDE_TELEGRAM_DATA_DIR` overrides the folder. Use the same value for the daemon and your shell.
+- **When the channel runs.** The channel server only runs when `CLAUDE_TELEGRAM_DESK=1` is set, which `claude-telegram code` sets for interactive sessions only. So it stays out of `claude -p` jobs and out of any session that merely has it configured.
+- **Network.** The daemon makes outbound connections to Telegram only. It opens no inbound ports.
 
-| Command | What it does |
-|---|---|
-| `/sessions` | List Claude Code sessions open in tmux panes (🟢 idle · ⏳ busy · ⏸ prompt open), with pin buttons |
-| `/to <n>` | Pin session *n*: every message goes there until `/unpin` |
-| `/unpin` | Back to auto-routing |
-| `/new [text]` | Fresh `claude -p` conversation instead (the pre-bridge behaviour), pinned until `/unpin` |
-| *reply to a message* | Replying to a session's message sends your reply to that session |
+## Development
 
-## Live-session bridge
-
-If you keep interactive `claude` sessions open in tmux, the bot talks to *those* instead of starting new ones.
-
-The rule is **one process owns each session**. Running `claude -p --resume <id>` on a session that's still open in a terminal forks it into two histories that diverge. So the bot never does that. It types your message into the pane (`tmux send-keys -l`, then Enter), exactly as if you were at the keyboard, and reads the reply back from the session transcript. The terminal and the phone are two windows onto the same conversation.
-
-- **Discovery.** tmux pane → pane process tree → `claude` PID → Claude Code's per-process status file (`~/.claude/sessions/<pid>.json`: session id, cwd, idle/busy/waiting) → transcript (`~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`). Titles and recent prompts come from the transcript's head and tail. These files are undocumented; the parsing is tolerant, but a Claude Code update can change them.
-- **Routing is sticky.** A message with no pin goes to the session you're already talking to. Order of precedence:
-  1. A Telegram reply to an answer goes back to that answer's session.
-  2. A pin.
-  3. The current session. Short follow-ups (under 40 characters) go straight there with no router call. Longer messages ask a small tool-less `claude -p --model haiku` classifier, and only switch (with a "↪ Switched to …" notice) when it is at least 85% sure the message belongs to a *different* session.
-  4. After 6 hours of silence, or if the pane has closed, plain routing: a confident pick goes through, otherwise you get buttons for the top 3 sessions plus "New session". With no live panes, the bot uses `claude -p` as before.
-
-  The current session is stored in the state file, so it survives restarts.
-- **Safety gates.** Nothing is typed unless the pane's foreground command is `claude`, the session is idle (status file *and* no spinner on screen), no prompt is open, and the prompt box is empty. It never appends to a draft you left there. Otherwise the message waits in a per-pane queue, up to 2h, and is sent in order.
-- **Replies.** The bot tails the transcript from the byte offset it recorded before sending. It relays the turn's text blocks and hides tool calls, the same as the `claude -p` path. It stops at the turn-end marker.
-- **Permission prompts.** If the session stops at an approval prompt mid-turn, the prompt comes to Telegram with one button per option. A button presses that option's number key, but only after re-checking that the same prompt is still open.
-- **`/stop`** on a bridged turn sends Esc (Claude Code's interrupt) to the pane.
-
-Test it without touching your real panes: `npx tsx scripts/smoke-bridge.ts` runs everything against a throwaway `claude --model haiku` on an isolated `tmux -L bridgetest` server. It checks for forks at the end (exactly one transcript and one owning process).
-
-## Configuration
-
-All env vars live in `.env`:
-
-| Var | Purpose | Default |
-|---|---|---|
-| `TELEGRAM_BOT_TOKEN` | From @BotFather | _(required)_ |
-| `TELEGRAM_ALLOWED_USER_ID` | The only user allowed to talk to the bot | _(required)_ |
-| `CLAUDE_BIN` | Path to the `claude` binary | `claude` |
-| `DEFAULT_CWD` | Working dir for new chats and `/vault` | _(required)_ |
-| `STATE_DIR` | Where per-chat session state is stored | _(required)_ |
-| `CLAUDE_MODEL` | `sonnet`, `haiku`, `opus`, or a full model id | `sonnet` |
-| `CLAUDE_EFFORT` | Thinking budget: `low`, `medium`, `high`, `xhigh`, `max` | `low` |
-| `PUSH_PORT` / `PUSH_SECRET` | Localhost `/push` server for scheduled briefs | `7421` / _(required)_ |
-| `PUSH_DOCUMENTS` | Allowlist for `/push-document`: `key=/abs/path,…` | _(unset — endpoint disabled)_ |
-| `TMUX_BRIDGE_ENABLED` | Route messages into live tmux Claude sessions | `true` |
-| `TMUX_BIN` / `TMUX_SOCKET` | tmux binary / optional `-L` socket name | `tmux` / _(default server)_ |
-| `ROUTER_MODEL` | Model for the session router | `haiku` |
-| `CLAUDE_CONFIG_DIR` | Claude Code config dir (`sessions/`, `projects/`) | `~/.claude` |
-
-To bump the default model permanently, edit `.env` and `systemctl --user restart claude-telegram`.
-
-## Design notes
-
-**Placeholder-per-cycle output.** Per user turn, the bot sends one `💭 thinking…` message. When Claude emits text, that message gets edited *exactly once* to the text. If Claude then uses a tool and responds again, a *new* `💭 thinking…` message is sent for the next cycle. Each Telegram message is therefore edited at most once. This is deliberately different from "stream tokens into one rolling message" — that pattern hits Telegram's edit-throttle, fights with chunk boundaries, and has a nasty failure mode where edits overwrite earlier content. The per-cycle pattern also gives you a free "I'm done" signal: when the last message in the chat is real content (not `thinking…`), the turn is finished.
-
-**Tool activity is silent.** The old version of this bot rendered `🔧 Tool …` / `✓ result` chatter for every tool call. Nice for debugging, ugly for daily use. Now: tools run, you see the output cycle that follows. If you want the trace, `journalctl` it.
-
-**Cold-spawn architecture.** Today, every message spawns `claude -p --resume <session-id>` as a fresh subprocess. The CLI cold start is ~3–5s before any token is generated. That's the main source of perceived latency. A future version may migrate to `@anthropic-ai/claude-agent-sdk` so one bot process keeps a Claude session warm in-memory — that should eliminate the bulk of cold-start lag.
-
-## Limitations
-
-- Linux-focused (systemd unit included). Should work fine on macOS via launchd; you'd have to adapt the service file.
-- One authorized user per bot instance. Not multi-tenant.
-- Telegram message size cap of 4 KB per message — long outputs get split into multiple messages, but tables and code blocks may break across the seam.
-- `/run` tokenizer doesn't handle paths with spaces. Don't put spaces in your project paths and you'll be fine.
-- No streaming of partial messages within a cycle. Cold-spawn + Telegram edit limits make this not worth doing today.
-
-## Security
-
-- Only the user matching `TELEGRAM_ALLOWED_USER_ID` is allowed to interact. Everyone else is silently ignored.
-- Claude runs with `--permission-mode bypassPermissions`. The bot effectively has the same filesystem + shell access as the user running the systemd service. **Don't run this on a machine where that would be unacceptable.**
-- The bot makes outbound connections to Telegram only. No inbound ports.
-- `.env` contains a long-lived bot token — keep it out of version control (already in `.gitignore`).
-- `POST /push-document` sends a file to your chat as a document attachment. A caller names a **key**, never a path: the key → path mapping lives only in `PUSH_DOCUMENTS`, so the endpoint cannot be used to read an arbitrary file even by something that already holds the push secret. `PUSH_DOCUMENTS` unset (the default) disables the endpoint entirely. Only list files you are willing to have delivered to your Telegram account.
-
-## Architecture
+```
+npm test            # vitest: router, channel server, protocol, poller, daemon (fake Telegram, real sockets)
+npm run typecheck   # tsc, including legacy/
+npm run smoke       # spawns `bin/claude-telegram desk-channel` over real stdio against a real router
+```
 
 ```
 src/
-├── index.ts              Bot entrypoint, command routing, auth gate
-├── lib/
-│   ├── env.ts            Zod-validated env config
-│   ├── claude.ts         Spawns `claude -p` and parses stream-json events
-│   ├── session.ts        Per-chat session-id + cwd + pin state, JSON-file backed
-│   ├── uploads.ts        Groups album/multi-file uploads into one prompt
-│   ├── vault.ts          Saves photo/voice attachments
-│   └── bridge/           Live tmux-session bridge
-│       ├── discovery.ts  pane → claude PID → session → transcript
-│       ├── transcript.ts JSONL tailing, turn tracking, summaries
-│       ├── tmux.ts       send-keys argv, capture-pane state (busy/prompt/draft)
-│       ├── bridge.ts     gated delivery, per-pane queue, reply tailing
-│       ├── router.ts     haiku classifier + tolerant JSON parsing
-│       ├── sticky.ts     stay-with-current-session routing decisions
-│       └── reply-targets.ts  message id → session for Telegram replies
-└── handlers/
-    ├── commands.ts       /start, /reset, /status, /cd, /vault, /stop
-    ├── bridge.ts         routing, /sessions /to /unpin /new, inline buttons
-    ├── text.ts           Placeholder-per-cycle text streaming
-    ├── media.ts          Photo + document uploads (albums batched)
-    └── voice.ts          Voice-note capture (transcription is gboard's job)
+├── index.ts          daemon entry: .env, signals
+├── daemon.ts         one bot, one router; direct-message help
+├── poll.ts           getUpdates loop; sorts updates for the router
+├── cli.ts            bin/claude-telegram: code | desk-channel
+├── paths.ts          data folder, socket, database, MCP config
+└── desk/
+    ├── router.ts     topics, owner gating, relaying, permission prompts, /desk_here
+    ├── channel.ts    the per-session stdio channel server and its socket link
+    ├── protocol.ts   socket messages (zod, JSON lines, size limits)
+    ├── launcher.ts   `code`: MCP config, claude flags, interactive-only check
+    ├── bot-api.ts    the Bot API calls the router makes
+    ├── state.ts      desk sessions and the group id (node:sqlite)
+    └── types.ts      the interfaces the router depends on
 ```
 
-## Stack
+## Other folders
 
-- [grammY](https://grammy.dev/) for the Telegram bot framework
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI as the brain (via `--output-format stream-json`)
-- TypeScript + [tsx](https://github.com/privatenumber/tsx) for the runtime
-- systemd for "always on"
+`signal-brief/`, `hk-events/` and `job-sift/` are separate tools that live in this repo; each has its own README. The first version of this bot (a `claude -p` / tmux bridge) is retired and kept in [`legacy/`](legacy/README.md).
 
 ## License
 

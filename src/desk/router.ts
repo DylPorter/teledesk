@@ -1,0 +1,538 @@
+/** The daemon side of desk sessions. Each Claude Code session's channel server
+ * connects to a unix socket here; the router gives it a forum topic in the owner's
+ * desk group and relays: owner's messages in the topic → that session, its replies
+ * and permission prompts → that topic. Only text the owner wrote ever reaches a
+ * session: gated on the sender's user id, and forwards, inline-bot messages and
+ * posts made as a chat are dropped. Depends only on ./types.ts interfaces. */
+import { createConnection, createServer, type Server, type Socket } from "node:net";
+import { chmodSync, lstatSync, statSync, unlinkSync } from "node:fs";
+import { dirname } from "node:path";
+import { ChannelMessage, clip, decode, elideMiddle, encode, LineReader, oneLine, VERDICT_TEXT, type DaemonMessage } from "./protocol.js";
+import type { DeskLog, DeskSessionRow, DeskState, DeskTelegram, DeskUpdate } from "./types.js";
+
+export const NO_SESSION_TEXT = "No Claude Code session is open for this folder. Start one with `claude-telegram code` there.";
+export const RECONNECTING_TEXT = "This session is reconnecting to the claude-telegram daemon. Send that again in a few seconds.";
+export const NO_GROUP_REASON = "No desk group is set up. In Telegram: create a group, turn on Topics, add the bot as an admin with Manage topics, then send /desk_here in the group.";
+export const GENERAL_HINT = "Each `claude-telegram code` session gets its own topic here. Write in that session's topic.";
+export const FORWARD_TEXT = "Forwarded messages aren't passed to the session. Paste the text if you want it acted on.";
+export const TEXT_ONLY = "Only text messages reach the session for now.";
+export const EARLIER_SESSION = "This prompt belongs to an earlier session.";
+export const NO_PROMPT = "No open prompt with that code in this session.";
+/** Under Telegram's 4096-character cap per message. */
+export const CHUNK = 4000;
+const MAX_CONNECTIONS = 32;
+const ANSWERED_KEEP = 200;
+const PENDING_KEEP = 50;
+/** Above this many unhandled messages a connection stops being read until it catches up. */
+const BACKLOG_PAUSE = 20;
+const BACKLOG_RESUME = 5;
+/** How often the forwarded-message notice may repeat in one topic. */
+const NOTICE_EVERY_MS = 10 * 60_000;
+
+/** Callback data on a permission prompt's buttons. The channel's pid names the exact session:
+ * a row is reused by later sessions in the same folder, the pid isn't. */
+export const permissionData = (sessionId: number, pid: number, requestId: string, allow: boolean) => `dp:${sessionId}:${pid}:${requestId}:${allow ? "y" : "n"}`;
+const PERMISSION_DATA = /^dp:(\d+):(\d+):([a-km-z]{5}):(y|n)$/;
+const DESK_HERE = /^\/desk_here(?:@\w+)?\s*$/i;
+const DESK_OFF = /^\/desk_off(?:@\w+)?\s*$/i;
+
+type Hello = Extract<ChannelMessage, { type: "hello" }>;
+interface Conn {
+  sock: Socket;
+  hello?: Hello;
+  helloTimer?: NodeJS.Timeout;
+  sessionId?: number;
+  /** The session ended (bye or disconnect): nothing more is relayed to or from it. */
+  ended: boolean;
+  /** Replaced by a newer connection from the same channel: closing it ends nothing. */
+  superseded: boolean;
+  /** This connection's messages are handled one at a time, in order. */
+  queue: Promise<void>;
+  backlog: number;
+  paused: boolean;
+  /** Open permission prompts: request id → the message with the buttons. */
+  pending: Map<string, { messageId: number; text: string }>;
+  answered: Set<string>;
+}
+
+export interface DeskRouterOptions {
+  socketPath: string;
+  /** The owner's Telegram user id. Nothing from anyone else reaches a session. */
+  ownerId: string;
+  telegram: DeskTelegram;
+  state: DeskState;
+  log: DeskLog;
+  /** Whether a process is still running (default: signal 0). */
+  alive?: (pid: number) => boolean;
+  /** After a restart, how long a live session has to reconnect before it's ended. */
+  graceMs?: number;
+  /** How long a new connection has to say hello. */
+  helloTimeoutMs?: number;
+}
+
+/** A topic name: "<folder> · <branch>", "#2" for a second session in the same folder, ≤ 128 chars. */
+export function topicName(title: string, branch: string | undefined, slot: number): string {
+  const clean = (s: string) => oneLine(s.replace(/[\u0000-\u001f\u007f-\u009f]/g, " "));
+  const suffix = slot > 1 ? ` #${slot}` : "";
+  const base = clean(title) || "session";
+  const b = branch ? clean(branch) : "";
+  return clip(b ? `${base} · ${b}` : base, 128 - suffix.length) + suffix;
+}
+
+/** Split text into Telegram-sized parts, preferring line breaks. */
+export function chunkText(text: string, size = CHUNK): string[] {
+  const parts: string[] = [];
+  let rest = text;
+  while (rest.length > size) {
+    let cut = rest.lastIndexOf("\n", size);
+    if (cut < size / 2) cut = size;
+    // Never split a surrogate pair.
+    if (cut === size && /[\ud800-\udbff]/.test(rest[cut - 1])) cut--;
+    parts.push(rest.slice(0, cut));
+    rest = rest.slice(cut).replace(/^\n/, "");
+  }
+  if (rest) parts.push(rest);
+  return parts;
+}
+
+/** A permission prompt as one or two messages; the buttons go on the last. Claude Code's
+ * description and input preview are untrusted display text: folded to one line each, behind
+ * labels, so they can't pose as a verdict or our words. A long one keeps its start and its end
+ * (the middle is hidden), so the end of a padded command always shows. */
+export function promptMessages(tool: string, description: string, preview: string, requestId: string): string[] {
+  const head = `🔐 Permission: ${clip(oneLine(tool), 100)}`;
+  const what = `What: ${elideMiddle(oneLine(description)) || "(no description)"}`;
+  const input = oneLine(preview);
+  const inputLine = input ? `Input: ${elideMiddle(input)}` : "";
+  const foot = `Tap a button, or reply "yes ${requestId}" or "no ${requestId}".`;
+  const one = `${head}\n${what}${inputLine ? `\n${inputLine}` : ""}\n\n${foot}`;
+  if (one.length <= CHUNK) return [one];
+  return [`${head}\n${what}`, `${head}\n${inputLine}\n\n${foot}`];
+}
+
+/** Whether something is accepting connections on a unix socket. */
+function answers(path: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const s = createConnection(path);
+    const done = (v: boolean) => { clearTimeout(t); s.destroy(); resolve(v); };
+    const t = setTimeout(() => done(false), 1000);
+    s.once("connect", () => done(true));
+    s.once("error", () => done(false));
+  });
+}
+
+const defaultAlive = (pid: number) => {
+  try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; }
+};
+const errText = (e: unknown) => (e as Error)?.message ?? String(e);
+const notModified = (e: unknown) => /TOPIC_NOT_MODIFIED|not modified/i.test(errText(e));
+
+export class DeskRouter {
+  private server?: Server;
+  private conns = new Set<Conn>();
+  private bySession = new Map<number, Conn>();
+  private stopping = false;
+  private loggedSenders = new Set<string>();
+  private loggedChats = new Set<string>();
+  private graceTimers = new Map<number, NodeJS.Timeout>();
+  private locks = new Map<string, Promise<void>>();
+  /** Group updates are handled one at a time, in arrival order. */
+  private updates: Promise<void> = Promise.resolve();
+  private noticeAt = new Map<string, number>();
+  private tg: DeskTelegram;
+  private state: DeskState;
+  private log: DeskLog;
+  private alive: (pid: number) => boolean;
+
+  constructor(private opts: DeskRouterOptions) {
+    this.tg = opts.telegram;
+    this.state = opts.state;
+    this.log = opts.log;
+    this.alive = opts.alive ?? defaultAlive;
+  }
+
+  // ---- lifecycle ----
+  async start(): Promise<void> {
+    const path = this.opts.socketPath;
+    // Only in a folder no one else can write to: otherwise another user could swap the socket.
+    const dir = dirname(path);
+    const st = statSync(dir);
+    const uid = process.getuid?.();
+    if (uid !== undefined && st.uid !== uid) throw new Error(`${dir} isn't owned by this user; not listening there`);
+    if (st.mode & 0o022) throw new Error(`${dir} is writable by other users; not listening there (chmod go-w it)`);
+    let existing;
+    try { existing = lstatSync(path); } catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; }
+    if (existing && !existing.isSocket()) throw new Error(`${path} exists and isn't a socket; not touching it`);
+    if (existing) {
+      if (await answers(path)) throw new Error(`another desk router is already listening on ${path}`);
+      unlinkSync(path);
+    }
+    const server = createServer((sock) => this.onConnection(sock));
+    this.server = server;
+    const listening = new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.once("listening", () => { server.off("error", reject); resolve(); });
+    });
+    // The socket file is created inside listen() itself: owner-only from the start (umask set
+    // only around that call), then chmod as well in case umask can't be set in this thread.
+    let restore: number | undefined;
+    try { restore = process.umask(0o177); } catch { /* not settable here */ }
+    try { server.listen(path); } finally { if (restore !== undefined) process.umask(restore); }
+    await listening;
+    chmodSync(path, 0o600);
+    // Only now that this router owns the socket: sessions left live by the last one close if they
+    // ended meanwhile, and running ones get time to reconnect. (Runs before any connection is handled.)
+    for (const row of this.state.live()) {
+      if (!row.pid || !this.alive(row.pid)) void this.lock(row.cwd, () => this.endRow(row.id));
+      else this.graceTimers.set(row.id, setTimeout(() => {
+        this.graceTimers.delete(row.id);
+        if (!this.bySession.has(row.id)) void this.lock(row.cwd, () => this.endRow(row.id, row.pid));
+      }, this.opts.graceMs ?? 90_000).unref());
+    }
+    server.on("error", (e) => this.log(`desk: socket error: ${e.message}`));
+  }
+
+  /** Daemon shutdown: drop the connections without ending their sessions (they reconnect). */
+  async stop(): Promise<void> {
+    this.stopping = true;
+    for (const t of this.graceTimers.values()) clearTimeout(t);
+    this.graceTimers.clear();
+    for (const c of this.conns) { clearTimeout(c.helloTimer); c.sock.destroy(); }
+    const server = this.server;
+    if (server) await new Promise<void>((r) => server.close(() => r()));
+    try { if (lstatSync(this.opts.socketPath).isSocket()) unlinkSync(this.opts.socketPath); } catch { /* gone */ }
+  }
+
+  /** Run fn after any earlier fn for the same folder: topic opening and closing never interleave. */
+  private lock(key: string, fn: () => Promise<void>): Promise<void> {
+    const run = (this.locks.get(key) ?? Promise.resolve()).then(fn).catch((e) => this.log(`desk: ${errText(e)}`));
+    this.locks.set(key, run);
+    void run.then(() => { if (this.locks.get(key) === run) this.locks.delete(key); });
+    return run;
+  }
+
+  // ---- channel connections ----
+  private onConnection(sock: Socket): void {
+    if (this.stopping || this.conns.size >= MAX_CONNECTIONS) { sock.destroy(); return; }
+    const conn: Conn = { sock, ended: false, superseded: false, queue: Promise.resolve(), backlog: 0, paused: false, pending: new Map(), answered: new Set() };
+    this.conns.add(conn);
+    // A connection that never says hello would hold a slot forever.
+    conn.helloTimer = setTimeout(() => { if (!conn.hello) sock.destroy(); }, this.opts.helloTimeoutMs ?? 10_000).unref();
+    const enqueue = (fn: () => Promise<void>) => {
+      conn.backlog++;
+      if (conn.backlog >= BACKLOG_PAUSE && !conn.paused) { conn.paused = true; sock.pause(); }
+      conn.queue = conn.queue.then(fn).catch((e) => this.log(`desk: ${errText(e)}`)).finally(() => {
+        conn.backlog--;
+        if (conn.paused && conn.backlog <= BACKLOG_RESUME) { conn.paused = false; sock.resume(); }
+      });
+    };
+    const reader = new LineReader((line) => {
+      const m = decode(ChannelMessage, line);
+      enqueue(() => m ? this.handle(conn, m) : Promise.resolve(this.write(conn, { type: "error", reason: "That wasn't a valid desk message." })));
+    });
+    sock.on("data", (d) => {
+      if (reader.push(d)) return;
+      this.log("desk: a channel sent an oversized line; disconnected it");
+      sock.destroy();
+    });
+    sock.on("error", () => { /* close follows */ });
+    sock.on("close", () => {
+      clearTimeout(conn.helloTimer);
+      this.conns.delete(conn);
+      enqueue(() => this.onClose(conn));
+    });
+  }
+
+  private write(conn: Conn, m: DaemonMessage): void {
+    if (!conn.sock.destroyed && conn.sock.writable) conn.sock.write(encode(m));
+  }
+
+  private async onClose(conn: Conn): Promise<void> {
+    if (this.stopping || conn.superseded) {
+      if (conn.sessionId !== undefined && this.bySession.get(conn.sessionId) === conn) this.bySession.delete(conn.sessionId);
+      return;
+    }
+    if (conn.hello) await this.lock(conn.hello.cwd, () => this.endSession(conn));
+  }
+
+  private async handle(conn: Conn, m: ChannelMessage): Promise<void> {
+    if (conn.ended) return;
+    if (m.type === "hello") {
+      if (conn.hello) { this.write(conn, { type: "error", reason: "hello was already sent on this connection" }); return; }
+      conn.hello = m;
+      clearTimeout(conn.helloTimer);
+      await this.lock(m.cwd, () => this.attach(conn));
+      return;
+    }
+    if (m.type === "bye") {
+      if (conn.hello) await this.lock(conn.hello.cwd, () => this.endSession(conn));
+      conn.sock.end();
+      return;
+    }
+    const row = this.topicOf(conn);
+    if (!row) { this.write(conn, { type: "error", reason: this.state.group() ? "This session has no topic yet." : NO_GROUP_REASON }); return; }
+    if (m.type === "reply") { await this.post(row.group_id, row.topic_id, m.text); return; }
+    await this.prompt(conn, row, m);
+  }
+
+  /** Post a permission prompt: details first if they need a message of their own, the buttons last.
+   * It becomes answerable from Telegram only once every part of it has been shown. If any part
+   * fails, the owner is told to answer in the terminal, and no answer from here is accepted. */
+  private async prompt(conn: Conn, row: DeskSessionRow & { group_id: string; topic_id: number }, m: Extract<ChannelMessage, { type: "permission_request" }>): Promise<void> {
+    const parts = promptMessages(m.tool_name, m.description, m.input_preview, m.request_id);
+    const buttons = [[{ text: "Allow", data: permissionData(row.id, conn.hello!.pid, m.request_id, true) }, { text: "Deny", data: permissionData(row.id, conn.hello!.pid, m.request_id, false) }]];
+    const text = parts.at(-1)!;
+    let mid: number | undefined;
+    try {
+      for (const p of parts.slice(0, -1)) await this.tg.send(row.group_id, row.topic_id, p);
+      mid = await this.tg.send(row.group_id, row.topic_id, text, buttons);
+    } catch (e) { this.log(`desk: couldn't show a permission prompt for session ${row.id}: ${errText(e)}`); }
+    if (mid === undefined) {
+      await this.post(row.group_id, row.topic_id, `🔐 Claude is asking to use ${clip(oneLine(m.tool_name), 100)}, but the prompt couldn't be shown here. Answer it in the terminal.`);
+      return;
+    }
+    conn.pending.set(m.request_id, { messageId: mid, text });
+    if (conn.pending.size > PENDING_KEEP) {
+      const [oldId, old] = conn.pending.entries().next().value!;
+      conn.pending.delete(oldId);
+      await this.tg.edit(row.group_id, old.messageId, `${old.text}\n\nNo longer tracked here; answer it in the terminal.`).catch(() => undefined);
+    }
+  }
+
+  /** The row and topic a connection's output goes to, if it's attached in the current group. */
+  private topicOf(conn: Conn): (DeskSessionRow & { group_id: string; topic_id: number }) | undefined {
+    if (conn.sessionId === undefined) return undefined;
+    const row = this.state.get(conn.sessionId);
+    const group = this.state.group();
+    if (!row || !group || row.group_id !== group || row.topic_id === null) return undefined;
+    return row as DeskSessionRow & { group_id: string; topic_id: number };
+  }
+
+  /** Give a connected session its topic: the same one again after a daemon restart, the
+   * folder's topic reopened, or a new one. Safe to call again (e.g. after /desk_here). */
+  private async attach(conn: Conn): Promise<void> {
+    const h = conn.hello;
+    if (!h || conn.ended || this.stopping) return;
+    const group = this.state.group();
+    if (!group) { this.write(conn, { type: "error", reason: NO_GROUP_REASON }); return; }
+    let row = this.state.findLive(h.cwd, h.pid);
+    if (row && row.group_id === group && row.topic_id !== null) {
+      // The same channel reconnecting (daemon restart, or a dropped socket).
+      this.bind(conn, row.id);
+      this.write(conn, { type: "welcome", session_id: row.id, topic_name: row.topic_name ?? "" });
+      return;
+    }
+    if (row?.group_id && row.topic_id !== null && row.group_id !== group) {
+      // Moving to a new desk group: the old topic says so and closes.
+      await this.post(row.group_id, row.topic_id, "Moved to another desk group.");
+      await this.tg.closeTopic(row.group_id, row.topic_id).catch(() => undefined);
+    }
+    row ??= this.state.claim(h.cwd, h.pid, h.title, h.branch);
+    const name = topicName(h.title, h.branch, row.slot);
+    let topic: number | undefined;
+    if (row.topic_id !== null && row.group_id === group) {
+      try { await this.tg.reopenTopic(group, row.topic_id); topic = row.topic_id; }
+      catch (e) { if (notModified(e)) topic = row.topic_id; else this.log(`desk: couldn't reopen topic ${row.topic_id} (${errText(e)}); opening a new one`); }
+      if (topic !== undefined && row.topic_name !== name) await this.tg.editTopic(group, topic, name).catch((e) => { if (!notModified(e)) this.log(`desk: couldn't rename topic: ${errText(e)}`); });
+    }
+    if (topic === undefined) {
+      try { topic = await this.tg.createTopic(group, name); }
+      catch (e) {
+        this.log(`desk: couldn't create a topic: ${errText(e)}`);
+        this.state.setOffline(row.id);
+        this.write(conn, { type: "error", reason: `Couldn't open a Telegram topic: ${clip(errText(e), 300)}` });
+        return;
+      }
+    }
+    this.state.setTopic(row.id, group, topic, name);
+    this.bind(conn, row.id);
+    await this.post(group, topic, `▶️ Session started\n${h.cwd}${h.branch ? ` (${h.branch})` : ""}`);
+    this.write(conn, { type: "welcome", session_id: row.id, topic_name: name });
+  }
+
+  private bind(conn: Conn, id: number): void {
+    const old = this.bySession.get(id);
+    if (old && old !== conn) {
+      old.superseded = true;
+      old.sock.destroy();
+      // The same channel reconnecting: its shown prompts are still open, so they stay answerable.
+      if (old.hello?.pid === conn.hello?.pid) { conn.pending = old.pending; conn.answered = old.answered; }
+    }
+    conn.sessionId = id;
+    this.bySession.set(id, conn);
+    const t = this.graceTimers.get(id);
+    if (t) { clearTimeout(t); this.graceTimers.delete(id); }
+  }
+
+  /** The session is over: its open prompts lose their buttons, "Session ended", topic closed. */
+  private async endSession(conn: Conn): Promise<void> {
+    if (conn.ended) return;
+    conn.ended = true;
+    const id = conn.sessionId;
+    if (id === undefined) return;
+    if (this.bySession.get(id) === conn) this.bySession.delete(id);
+    const row = this.state.get(id);
+    if (row?.group_id) {
+      for (const p of conn.pending.values()) await this.tg.edit(row.group_id, p.messageId, `${p.text}\n\nSession ended before an answer.`).catch(() => undefined);
+    }
+    conn.pending.clear();
+    await this.endRow(id, conn.hello?.pid);
+  }
+
+  /** Close a row's topic and mark it offline (only if it's still the same live session). */
+  private async endRow(id: number, pid?: number | null): Promise<void> {
+    const row = this.state.get(id);
+    if (!row || row.status !== "live" || (pid != null && row.pid !== pid)) return;
+    if (this.bySession.has(id)) return; // reconnected meanwhile
+    if (row.group_id && row.topic_id !== null) {
+      await this.post(row.group_id, row.topic_id, "⏹ Session ended");
+      await this.tg.closeTopic(row.group_id, row.topic_id).catch((e) => { if (!notModified(e)) this.log(`desk: couldn't close topic ${row.topic_id}: ${errText(e)}`); });
+    }
+    this.state.setOffline(id);
+  }
+
+  /** Send text to a topic in ≤ CHUNK parts. A failed part is logged and the rest still go. */
+  private async post(chatId: string, threadId: number | undefined, text: string): Promise<void> {
+    const parts = chunkText(text);
+    let failed = 0;
+    for (const p of parts) {
+      try { await this.tg.send(chatId, threadId, p); } catch (e) { failed++; this.log(`desk: send failed: ${errText(e)}`); }
+    }
+    if (failed) this.log(`desk: ${failed} of ${parts.length} part(s) didn't send`);
+  }
+
+  // ---- Telegram updates from groups ----
+  /** Every group update the bot's poll loop sees. Updates are handled one at a time in the
+   * order they arrive; the returned promise settles when this one is done. Never rejects. */
+  onUpdate(u: DeskUpdate): Promise<void> {
+    const run = this.updates.then(() => this.route(u)).catch((e) => this.log(`desk: update failed: ${errText(e)}`));
+    this.updates = run;
+    return run;
+  }
+
+  private logOnce(set: Set<string>, key: string, message: string): void {
+    if (set.has(key)) return;
+    set.add(key);
+    this.log(message);
+  }
+
+  private async route(u: DeskUpdate): Promise<void> {
+    if (String(u.fromId) !== this.opts.ownerId) {
+      if (u.kind === "callback") await this.tg.answerCallback(u.id).catch(() => undefined);
+      const who = String(u.fromId ?? "unknown");
+      this.logOnce(this.loggedSenders, who, `desk: ignored a group update from user ${who} (only the owner's count)`);
+      return;
+    }
+    const chat = String(u.chatId);
+    if (u.kind === "message") {
+      // The owner's account, but not the owner's words, or not as themselves: never relayed.
+      if (u.senderChat || u.fromIsBot) { this.logOnce(this.loggedSenders, `as-chat:${chat}`, `desk: ignored a message posted as a chat or by a bot in ${chat}`); return; }
+      if (u.edited) return;
+      if (u.forwarded || u.viaBot) {
+        const thread = u.isTopic ? u.threadId : undefined;
+        if (chat !== this.state.group()) return;
+        const key = `${chat}:${thread ?? "general"}`;
+        if (Date.now() - (this.noticeAt.get(key) ?? 0) < NOTICE_EVERY_MS) return;
+        this.noticeAt.set(key, Date.now());
+        await this.post(chat, thread, FORWARD_TEXT);
+        return;
+      }
+    }
+    if (u.kind === "message" && u.text && DESK_HERE.test(u.text)) { await this.deskHere(chat, u.isTopic ? u.threadId : undefined); return; }
+    const group = this.state.group();
+    if (chat !== group) {
+      if (u.kind === "callback") await this.tg.answerCallback(u.id).catch(() => undefined);
+      this.logOnce(this.loggedChats, chat, `desk: ignoring group ${chat} (not the desk group; /desk_here there to make it one)`);
+      return;
+    }
+    if (u.kind === "callback") {
+      const m = PERMISSION_DATA.exec(u.data ?? "");
+      if (!m) { await this.tg.answerCallback(u.id).catch(() => undefined); return; }
+      await this.verdict(Number(m[1]), m[3], m[4] === "y", { callbackId: u.id, messageId: u.messageId, text: u.text, pid: Number(m[2]) });
+      return;
+    }
+    const thread = u.isTopic ? u.threadId : undefined;
+    const text = u.text;
+    if (!text) {
+      if (u.media && thread !== undefined) await this.post(chat, thread, TEXT_ONLY);
+      return;
+    }
+    if (DESK_OFF.test(text)) {
+      this.state.setGroup(undefined);
+      await this.post(chat, thread, "Desk is off: new sessions won't open topics and nothing here reaches a session. Send /desk_here in a group to turn it back on.");
+      return;
+    }
+    if (thread === undefined) { await this.post(chat, undefined, GENERAL_HINT); return; }
+    const row = this.state.byTopic(chat, thread);
+    const conn = row ? this.bySession.get(row.id) : undefined;
+    if (!row || !conn || conn.ended) {
+      await this.post(chat, thread, row?.status === "live" ? RECONNECTING_TEXT : NO_SESSION_TEXT);
+      return;
+    }
+    const v = VERDICT_TEXT.exec(text);
+    if (v) { await this.verdict(row.id, v[2].toLowerCase(), v[1].toLowerCase().startsWith("y"), { threadId: thread }); return; }
+    this.write(conn, { type: "message", text, message_id: u.messageId });
+    void this.tg.typing(chat, thread).catch(() => undefined);
+  }
+
+  /** A permission answer (button or typed), relayed to the session it belongs to, once, and only
+   * for a prompt this session raised that was shown in full in its topic. A tap must come from
+   * that very message. Anything else is refused here: an approval never takes effect for
+   * something the owner wasn't shown. */
+  private async verdict(sessionId: number, requestId: string, allow: boolean, via: { callbackId?: string; messageId?: number; text?: string; threadId?: number; pid?: number }): Promise<void> {
+    const group = this.state.group()!;
+    const conn = this.bySession.get(sessionId);
+    const say = async (t: string) => {
+      if (via.callbackId) await this.tg.answerCallback(via.callbackId, t).catch(() => undefined);
+      else await this.post(group, via.threadId, t);
+    };
+    const stale = async (t: string, note: string) => {
+      await say(t);
+      if (via.messageId && via.text) await this.tg.edit(group, via.messageId, `${via.text}\n\n${note}`).catch(() => undefined);
+    };
+    if (!conn || conn.ended) { await stale("This session has ended.", "Session ended before an answer."); return; }
+    if (via.pid !== undefined && conn.hello?.pid !== via.pid) { await stale(EARLIER_SESSION, "Session ended before an answer."); return; }
+    if (conn.answered.has(requestId)) { await say("Already answered."); return; }
+    const p = conn.pending.get(requestId);
+    if (!p || (via.callbackId !== undefined && via.messageId !== p.messageId)) {
+      await say(NO_PROMPT);
+      if (via.callbackId && via.messageId && via.text) await this.tg.edit(group, via.messageId, `${via.text}\n\nCan't be answered here any more; answer it in the terminal.`).catch(() => undefined);
+      return;
+    }
+    conn.answered.add(requestId);
+    if (conn.answered.size > ANSWERED_KEEP) conn.answered.delete(conn.answered.values().next().value!);
+    this.write(conn, { type: "verdict", request_id: requestId, behavior: allow ? "allow" : "deny" });
+    const label = allow ? "✅ Allowed" : "❌ Denied";
+    if (via.callbackId) await this.tg.answerCallback(via.callbackId, label).catch(() => undefined);
+    conn.pending.delete(requestId);
+    await this.tg.edit(group, p.messageId, `${p.text}\n\n${label}`).catch((e) => this.log(`desk: couldn't mark a prompt answered: ${errText(e)}`));
+  }
+
+  /** /desk_here from the owner: make this group the desk group if it's ready and private, else
+   * say what's missing. Anyone else in the group could read every reply and permission preview. */
+  private async deskHere(chatId: string, threadId?: number): Promise<void> {
+    const missing: string[] = [];
+    try {
+      const chat = await this.tg.getChat(chatId);
+      if (chat.username) missing.push("This group is public (it has a @username). Make it private: anyone who can open it could read your sessions.");
+      if (!chat.is_forum) missing.push("Topics are off. Turn on Topics in the group's settings.");
+      const count = await this.tg.getChatMemberCount(chatId);
+      if (count > 2) missing.push(`This group has ${count} members. Use a group with just you and the bot: anyone in it can read your sessions and permission prompts.`);
+      const me = await this.tg.getMe();
+      const member = await this.tg.getChatMember(chatId, me.id);
+      if (member.status !== "administrator" && member.status !== "creator") missing.push("The bot isn't an admin here. Make it an admin with the Manage topics right.");
+      else if (member.status === "administrator" && !member.can_manage_topics) missing.push("The bot can't manage topics. Turn on Manage topics in its admin rights.");
+    } catch (e) { missing.push(`Couldn't check this group: ${clip(errText(e), 200)}`); }
+    if (missing.length) {
+      await this.post(chatId, threadId, `Not set up yet:\n• ${missing.join("\n• ")}\n\nThen send /desk_here again.`);
+      return;
+    }
+    this.state.setGroup(chatId);
+    this.log(`desk: group ${chatId} is now the desk group`);
+    await this.post(chatId, threadId, "✅ This is the desk group now. Each `claude-telegram code` session gets its own topic here.");
+    for (const c of this.conns) {
+      if (!c.hello || c.ended) continue;
+      if (c.sessionId === undefined || this.state.get(c.sessionId)?.group_id !== chatId) void this.lock(c.hello.cwd, () => this.attach(c));
+    }
+  }
+}
