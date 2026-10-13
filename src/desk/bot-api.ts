@@ -23,7 +23,7 @@ export class BotApi implements DeskTelegram {
   }
 
   getMe() { return this.call<{ id: number }>("getMe", {}); }
-  getChat(chatId: string) { return this.call<{ type: string; is_forum?: boolean; username?: string }>("getChat", { chat_id: chatId }); }
+  getChat(chatId: string) { return this.call<{ type: string; is_forum?: boolean; username?: string; title?: string }>("getChat", { chat_id: chatId }); }
   getChatMemberCount(chatId: string) { return this.call<number>("getChatMemberCount", { chat_id: chatId }); }
   getChatMember(chatId: string, userId: number) { return this.call<{ status: string; can_manage_topics?: boolean }>("getChatMember", { chat_id: chatId, user_id: userId }); }
   async createTopic(chatId: string, name: string): Promise<number> {

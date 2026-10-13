@@ -47,7 +47,7 @@ class FakeTelegram implements DeskTelegram {
   renamed: { id: number; name: string }[] = [];
   answers: { id: string; text?: string }[] = [];
   typingIn: number[] = [];
-  chat: { type: string; is_forum?: boolean; username?: string } = { type: "supergroup", is_forum: true };
+  chat: { type: string; is_forum?: boolean; username?: string; title?: string } = { type: "supergroup", is_forum: true };
   memberCount = 2;
   member: { status: string; can_manage_topics?: boolean } = { status: "administrator", can_manage_topics: true };
   failSend?: (text: string) => boolean;
@@ -370,6 +370,26 @@ describe("desk router: gating", () => {
     await router.onUpdate({ kind: "message", chatId: -100999, chatType: "supergroup", fromId: OWNER, messageId: 1, threadId: s.topic, isTopic: true, text: "hi" });
     await settle();
     expect(s.c.of("message")).toEqual([]);
+  });
+
+  it("the owner's message in a wrong group gets one private hint, nothing posted there", async () => {
+    const tg = new FakeTelegram();
+    tg.chat = { type: "group", title: "Claude Code Topics" }; // the same-named old group, Topics off
+    const { router } = await setup({ tg });
+    const other = "-100999";
+    const msg = (text: string): DeskUpdate => ({ kind: "message", chatId: Number(other), chatType: "group", fromId: OWNER, messageId: msgId++, text });
+    await router.onUpdate(msg("hello?"));
+    await until(() => tg.sent.some((x) => x.chat === String(OWNER)));
+    const dms = () => tg.sent.filter((x) => x.chat === String(OWNER));
+    expect(dms().length).toBe(1);
+    expect(dms()[0].text).toContain('"Claude Code Topics"');
+    expect(dms()[0].text).toContain("isn't the desk group");
+    expect(dms()[0].text).toContain(other);
+    // A second message gets no second DM, and the wrong group itself never sees a post.
+    await router.onUpdate(msg("hello??"));
+    await settle();
+    expect(dms().length).toBe(1);
+    expect(tg.sent.filter((x) => x.chat === other).length).toBe(0);
   });
 });
 

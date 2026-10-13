@@ -8,7 +8,7 @@ export interface DeskButton { text: string; data: string }
  * message carries Telegram's description). Text is always sent as plain text. */
 export interface DeskTelegram {
   getMe(): Promise<{ id: number }>;
-  getChat(chatId: string): Promise<{ type: string; is_forum?: boolean; username?: string }>;
+  getChat(chatId: string): Promise<{ type: string; is_forum?: boolean; username?: string; title?: string }>;
   getChatMember(chatId: string, userId: number): Promise<{ status: string; can_manage_topics?: boolean }>;
   getChatMemberCount(chatId: string): Promise<number>;
   /** Create a forum topic; resolves to its message_thread_id. */

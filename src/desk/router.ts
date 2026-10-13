@@ -160,6 +160,8 @@ export class DeskRouter {
   private stopping = false;
   private loggedSenders = new Set<string>();
   private loggedChats = new Set<string>();
+  /** Groups the owner already got a wrong-group DM about (once each, per daemon run). */
+  private hintedChats = new Set<string>();
   private graceTimers = new Map<number, NodeJS.Timeout>();
   private locks = new Map<string, Promise<void>>();
   /** Group updates are handled one at a time, in arrival order. */
@@ -537,6 +539,20 @@ export class DeskRouter {
     await this.post(chat, undefined, PRIVACY_OFF);
   }
 
+  /** The owner wrote in a group that isn't the desk group: nothing there reaches a session, and
+   * silence just looks like a broken bot (a same-named old group is exactly how that happens).
+   * Tell them once per group, by DM — the wrong group itself may have readers who should learn
+   * nothing about the desk. */
+  private async wrongGroupHint(chat: string): Promise<void> {
+    if (this.hintedChats.has(chat)) return;
+    if (this.hintedChats.size >= MEMORY_KEEP) this.hintedChats.clear();
+    this.hintedChats.add(chat);
+    let title: string | undefined;
+    try { title = (await this.tg.getChat(chat)).title; } catch { /* the id identifies the group either way */ }
+    const text = `Your message in${title ? ` "${title}"` : " a group"} reached no session: that group isn't the desk group.\nSend /desk_here there to make it one.\nGroup id: ${chat}`;
+    await this.tg.send(this.opts.ownerId, undefined, text).catch((e) => this.log(`desk: couldn't tell the owner about group ${chat}: ${errText(e)}`));
+  }
+
   // ---- Telegram updates from groups ----
   /** Every group update the bot's poll loop sees. Updates are handled one at a time in the
    * order they arrive; the returned promise settles when this one is done. Never rejects. */
@@ -594,6 +610,7 @@ export class DeskRouter {
     const group = this.state.group();
     if (chat !== group) {
       if (u.kind === "callback") await this.tg.answerCallback(u.id).catch(() => undefined);
+      else void this.wrongGroupHint(chat);
       this.logOnce(this.loggedChats, chat, `desk: ignoring group ${chat} (not the desk group; /desk_here there to make it one)`);
       return;
     }
