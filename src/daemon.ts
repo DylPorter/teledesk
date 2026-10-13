@@ -20,6 +20,8 @@ export interface DaemonOptions {
   poller?: { run(onUpdate: (u: RawUpdate) => void, signal: AbortSignal): Promise<void> };
   alive?: (pid: number) => boolean;
   graceMs?: number;
+  /** Ended sessions' topics are deleted after this many days without activity (default 7). */
+  topicTtlDays?: number;
   /** Polling can't continue (Telegram rejected the token). */
   onFatal?: (e: Error) => void;
 }
@@ -37,7 +39,9 @@ export function helpText(state: DeskState): string {
     "2. Make the bot an admin with the Manage topics right.",
     "3. Send /desk_here in the group.",
     "",
-    "Then run `claude-telegram code` in any folder. That session gets its own topic: write there to talk to it. Its permission prompts show up there with Allow and Deny.",
+    "Then start Claude Code with `claude-telegram code` (or run `claude-telegram install` once and plain `claude` works too). Inside a session, /desk opens its topic here: write there to talk to it, and its permission prompts show up there with Allow and Deny. /desk off closes it.",
+    "",
+    "Topics of ended sessions are deleted after 7 days of inactivity (DESK_TOPIC_TTL_DAYS); the transcripts on this machine are untouched.",
     "",
     `Desk group: ${state.group() ? "set up" : "not set up yet"}`,
     `Live sessions (${live.length}):`,
@@ -45,12 +49,16 @@ export function helpText(state: DeskState): string {
   ].join("\n");
 }
 
+/** How often the stale-topic sweep runs. */
+export const SWEEP_EVERY_MS = 3_600_000;
+
 export class DeskDaemon {
   router?: DeskRouter;
   state?: SqliteDeskState;
   private db?: DatabaseSync;
   private abort = new AbortController();
   private polling?: Promise<void>;
+  private sweepTimer?: NodeJS.Timeout;
   private tg: DeskTelegram;
   private loggedDm = new Set<string>();
 
@@ -65,9 +73,13 @@ export class DeskDaemon {
     this.db = new DatabaseSync(paths.db);
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;");
     this.state = new SqliteDeskState(this.db, sqliteMeta(this.db));
-    this.router = new DeskRouter({ socketPath: paths.socket, ownerId: this.o.ownerId, telegram: this.tg, state: this.state, log, alive: this.o.alive, graceMs: this.o.graceMs });
+    this.router = new DeskRouter({ socketPath: paths.socket, ownerId: this.o.ownerId, telegram: this.tg, state: this.state, log, alive: this.o.alive, graceMs: this.o.graceMs, topicTtlDays: this.o.topicTtlDays });
     try { await this.router.start(); }
     catch (e) { this.db.close(); this.db = undefined; throw e; }
+    const sweep = () => void this.router?.sweepStaleTopics().catch((e: Error) => log(`claude-telegram: topic sweep failed: ${e.message}`));
+    sweep();
+    this.sweepTimer = setInterval(sweep, SWEEP_EVERY_MS);
+    this.sweepTimer.unref();
     const poller = this.o.poller ?? new Poller(this.o.token!, log);
     this.polling = poller.run((u) => this.onUpdate(u), this.abort.signal).catch((e: Error) => {
       log(`claude-telegram: polling stopped: ${e.message}`);
@@ -96,6 +108,7 @@ export class DeskDaemon {
    * the daemon is down is closed ("Session ended") when it starts again. */
   async stop(): Promise<void> {
     this.abort.abort();
+    if (this.sweepTimer) { clearInterval(this.sweepTimer); this.sweepTimer = undefined; }
     await this.router?.stop();
     await this.polling?.catch(() => undefined);
     this.db?.close();

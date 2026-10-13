@@ -28,7 +28,7 @@ let n = 1;
 const tg: DeskTelegram = {
   getMe: async () => ({ id: 1 }), getChat: async () => ({ type: "supergroup", is_forum: true }),
   getChatMember: async () => ({ status: "administrator", can_manage_topics: true }), getChatMemberCount: async () => 2,
-  createTopic: async () => 55, editTopic: async () => {}, reopenTopic: async () => {},
+  createTopic: async () => 55, editTopic: async () => {}, reopenTopic: async () => {}, deleteTopic: async () => {},
   closeTopic: async (_c, t) => { closed.push(t); },
   send: async (_c, thread, text, buttons) => { const id = n++; sent.push({ thread, text, buttons, id }); return id; },
   edit: async () => {}, typing: async () => {}, answerCallback: async () => {},
@@ -59,6 +59,16 @@ try {
   if (!("claude/channel" in caps) || !("claude/channel/permission" in caps)) throw new Error(`missing channel capabilities: ${JSON.stringify(caps)}`);
   ok(`channel server started in ${Date.now() - t0} ms with both channel capabilities`);
 
+  // Dormant until desk_on: no topic, reply refused.
+  await new Promise((r) => setTimeout(r, 400));
+  if (sent.some((s) => s.text.startsWith("▶️ Session started"))) throw new Error("the channel attached before desk_on");
+  const refused = await client.callTool({ name: "reply", arguments: { text: "early" } }) as { content: { text: string }[]; isError?: boolean };
+  if (!refused.isError) throw new Error("reply worked while the desk was dormant");
+  ok("dormant until /desk: no topic, reply refused");
+
+  const on = await client.callTool({ name: "desk_on", arguments: {} }) as { content: { text: string }[]; isError?: boolean };
+  if (on.isError) throw new Error(`desk_on failed: ${on.content[0].text}`);
+  ok(`desk_on: ${on.content[0].text}`);
   await wait("Session started", () => sent.some((s) => s.text.startsWith("▶️ Session started")));
   ok("session got its topic");
 

@@ -16,11 +16,13 @@ export function deskMcpConfig(command: string, args: string[]): { mcpServers: Re
 
 /** The reply tool, pre-allowed so each answer to the owner doesn't need a permission tap. */
 export const REPLY_TOOL = `mcp__${CHANNEL_NAME}__reply`;
+/** Reply plus the desk on/off tools (/desk): using the desk itself never needs a tap. */
+export const DESK_TOOLS = [REPLY_TOOL, `mcp__${CHANNEL_NAME}__desk_on`, `mcp__${CHANNEL_NAME}__desk_off`].join(",");
 
 /** These flags take several values, so they're given in --flag=value form: a prompt or other
  * argument after them can't be swallowed as another config file, channel or tool. */
 export function claudeArgs(configFile: string, userArgs: string[]): string[] {
-  return [`--mcp-config=${configFile}`, `--dangerously-load-development-channels=server:${CHANNEL_NAME}`, `--allowedTools=${REPLY_TOOL}`, ...userArgs];
+  return [`--mcp-config=${configFile}`, `--dangerously-load-development-channels=server:${CHANNEL_NAME}`, `--allowedTools=${DESK_TOOLS}`, ...userArgs];
 }
 
 /** claude's subcommands (claude --help, plus older names): none of them is an interactive session. */

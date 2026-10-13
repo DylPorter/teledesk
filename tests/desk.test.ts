@@ -14,6 +14,7 @@ import { BEFORE_SESSION, DEFAULT_LIMITS, DeskRouter, REPLY_MARK, type DeskLimits
 import { SqliteDeskState, sqliteMeta } from "../src/desk/state.js";
 import { REFUSAL, runDeskChannel, startDeskChannel, type DeskChannel } from "../src/desk/channel.js";
 import { claudeArgs, deskMcpConfig, interactive, olderThan, runClaude, writeDeskConfig } from "../src/desk/launcher.js";
+import { BLOCK_START, install, installBlock, uninstall, uninstallBlock } from "../src/desk/install.js";
 import { cleanText, previewFields } from "../src/desk/prompt.js";
 import { BotApi } from "../src/desk/bot-api.js";
 import type { DeskButton, DeskTelegram, DeskUpdate } from "../src/desk/types.js";
@@ -44,6 +45,7 @@ class FakeTelegram implements DeskTelegram {
   edits: { chat: string; id: number; text: string }[] = [];
   closed: number[] = [];
   reopened: number[] = [];
+  deleted: { chat: string; id: number }[] = [];
   renamed: { id: number; name: string }[] = [];
   answers: { id: string; text?: string }[] = [];
   typingIn: number[] = [];
@@ -59,6 +61,7 @@ class FakeTelegram implements DeskTelegram {
   async editTopic(_c: string, id: number, name: string) { this.renamed.push({ id, name }); }
   async closeTopic(_c: string, id: number) { this.closed.push(id); }
   async reopenTopic(_c: string, id: number) { this.reopened.push(id); }
+  async deleteTopic(chat: string, id: number) { this.deleted.push({ chat, id }); }
   async send(chat: string, thread: number | undefined, text: string, buttons?: DeskButton[][]) {
     if (this.failSend?.(text)) throw new Error("telegram sendMessage: Bad Request: boom");
     const id = this.nextMsg++;
@@ -295,7 +298,7 @@ describe("desk router: connection limits", () => {
     writeFileSync(join(dir, "desk.sock"), "");
     const logs: string[] = [];
     const [, serverT] = InMemoryTransport.createLinkedPair();
-    const ch = await startDeskChannel({ socketPath: join(dir, "desk.sock"), hello: { type: "hello", cwd: "/w", pid: 1, title: "w" }, transport: serverT, log: (m) => logs.push(m), backoff: { min: 5, max: 10 } });
+    const ch = await startDeskChannel({ socketPath: join(dir, "desk.sock"), hello: { type: "hello", cwd: "/w", pid: 1, title: "w" }, transport: serverT, log: (m) => logs.push(m), backoff: { min: 5, max: 10 }, autostart: true });
     cleanups.push(() => ch.close());
     await until(() => logs.some((l) => /isn't a socket owned by this user/.test(l)));
     expect(ch.link.isConnected).toBe(false);
@@ -370,6 +373,22 @@ describe("desk router: gating", () => {
     await router.onUpdate({ kind: "message", chatId: -100999, chatType: "supergroup", fromId: OWNER, messageId: 1, threadId: s.topic, isTopic: true, text: "hi" });
     await settle();
     expect(s.c.of("message")).toEqual([]);
+  });
+
+  it("bot echoes don't turn the desk off; a human stranger's message still does", async () => {
+    const { router, state, tg } = await setup();
+    // The session's own reply echoing back from its topic: from = the bot itself.
+    await router.onUpdate({ kind: "message", chatId: GROUP, chatType: "supergroup", fromId: 999, messageId: msgId++, isTopic: true, threadId: 5, text: "🤖 a reply", fromIsBot: true });
+    // A post "as the group" (anonymous admin): from = GroupAnonymousBot, sender_chat set.
+    await router.onUpdate({ kind: "message", chatId: GROUP, chatType: "supergroup", fromId: 1087968824, messageId: msgId++, text: "as the group", fromIsBot: true, senderChat: true });
+    await settle();
+    expect(state.group()).toBe(G);
+    expect(tg.sent.filter((s) => s.text === PRIVACY_OFF)).toEqual([]);
+    // A real human who isn't the owner still trips the breach.
+    await router.onUpdate({ kind: "message", chatId: GROUP, chatType: "supergroup", fromId: STRANGER, messageId: msgId++, text: "hi" });
+    await settle();
+    expect(state.group()).toBeUndefined();
+    expect(tg.sent.filter((s) => s.text === PRIVACY_OFF)).toHaveLength(1);
   });
 
   it("the owner's message in a wrong group gets one private hint, nothing posted there", async () => {
@@ -732,7 +751,7 @@ describe("desk router: /desk_here and /desk_off", () => {
 describe("desk channel server", () => {
   async function channel(t: Awaited<ReturnType<typeof setup>>, cwd = "/w/proj", pid = 77) {
     const [clientT, serverT] = InMemoryTransport.createLinkedPair();
-    const ch: DeskChannel = await startDeskChannel({ socketPath: t.socketPath, hello: { type: "hello", cwd, pid, title: "proj", branch: "main" }, transport: serverT, backoff: { min: 10, max: 40 } });
+    const ch: DeskChannel = await startDeskChannel({ socketPath: t.socketPath, hello: { type: "hello", cwd, pid, title: "proj", branch: "main" }, transport: serverT, backoff: { min: 10, max: 40 }, autostart: true });
     cleanups.push(() => ch.close());
     const client = new Client({ name: "claude-code", version: "1" });
     const chat: { content: string; meta: Record<string, string> }[] = [];
@@ -753,7 +772,7 @@ describe("desk channel server", () => {
     const { client } = await channel(t);
     expect(client.getServerCapabilities()?.experimental).toEqual({ "claude/channel": {}, "claude/channel/permission": {} });
     expect(client.getInstructions()).toMatch(/reply tool/);
-    expect((await client.listTools()).tools.map((x) => x.name)).toEqual(["reply"]);
+    expect((await client.listTools()).tools.map((x) => x.name)).toEqual(["reply", "desk_on", "desk_off"]);
   });
 
   it("owner's message → channel notification with message_id; reply tool → the session's topic", async () => {
@@ -793,7 +812,7 @@ describe("desk channel server", () => {
     await new Promise<void>((r) => server.listen(path, () => r()));
     cleanups.push(() => new Promise<void>((r) => { for (const x of socks) x.destroy(); server.close(() => r()); }));
     const [clientT, serverT] = InMemoryTransport.createLinkedPair();
-    const ch = await startDeskChannel({ socketPath: path, hello: { type: "hello", cwd: "/w", pid: 3, title: "w" }, transport: serverT });
+    const ch = await startDeskChannel({ socketPath: path, hello: { type: "hello", cwd: "/w", pid: 3, title: "w" }, transport: serverT, autostart: true });
     cleanups.push(() => ch.close());
     const client = new Client({ name: "claude-code", version: "1" });
     const verdicts: unknown[] = [];
@@ -824,7 +843,7 @@ describe("desk channel server", () => {
   it("tells Claude when there's no desk group instead of pretending it sent", async () => {
     const t = await setup({ group: false });
     const [clientT, serverT] = InMemoryTransport.createLinkedPair();
-    const ch = await startDeskChannel({ socketPath: t.socketPath, hello: { type: "hello", cwd: "/w/proj", pid: 5, title: "proj" }, transport: serverT });
+    const ch = await startDeskChannel({ socketPath: t.socketPath, hello: { type: "hello", cwd: "/w/proj", pid: 5, title: "proj" }, transport: serverT, autostart: true });
     cleanups.push(() => ch.close());
     const client = new Client({ name: "claude-code", version: "1" });
     await client.connect(clientT);
@@ -852,10 +871,160 @@ describe("desk channel server", () => {
   });
 });
 
+describe("desk channel: dormant until /desk", () => {
+  const connect = async (t: Awaited<ReturnType<typeof setup>>, cwd: string, pid: number, chat?: { content: string }[]) => {
+    const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+    const ch = await startDeskChannel({ socketPath: t.socketPath, hello: { type: "hello", cwd, pid, title: cwd.split("/").pop()! }, transport: serverT, backoff: { min: 10, max: 40 } });
+    cleanups.push(() => ch.close());
+    const client = new Client({ name: "claude-code", version: "1" });
+    if (chat) client.setNotificationHandler(z.object({ method: z.literal("notifications/claude/channel"), params: z.object({ content: z.string(), meta: z.record(z.string(), z.string()) }) }), (n) => { chat.push(n.params); });
+    await client.connect(clientT);
+    const call = async (name: string) => (await client.callTool({ name, arguments: {} })) as { content: { text: string }[]; isError?: boolean };
+    return { ch, client, call };
+  };
+
+  it("starts dormant: no topic, reply refused, permission prompts not relayed", async () => {
+    const t = await setup();
+    const { client } = await connect(t, "/w/dormant", 91);
+    await settle();
+    expect(t.state.findLive("/w/dormant", 91)).toBeUndefined();
+    expect(t.tg.topics).toEqual([]);
+    const reply = await client.callTool({ name: "reply", arguments: { text: "hi" } }) as { content: { text: string }[]; isError?: boolean };
+    expect(reply.isError).toBe(true);
+    expect(reply.content[0].text).toMatch(/\/desk/);
+    await (client as unknown as { notification(n: unknown): Promise<void> }).notification({
+      method: "notifications/claude/channel/permission_request",
+      params: { request_id: "abcde", tool_name: "Bash", description: "List files", input_preview: "{\"command\":\"ls\"}" },
+    });
+    await settle();
+    expect(t.tg.sent.filter((m) => m.buttons)).toEqual([]);
+  });
+
+  it("desk_on opens the topic and relays; desk_off closes it; desk_on reopens the same one", async () => {
+    const t = await setup();
+    const chat: { content: string }[] = [];
+    const { client, call } = await connect(t, "/w/d", 92, chat);
+    const on = await call("desk_on");
+    expect(on.isError).toBeFalsy();
+    expect(on.content[0].text).toMatch(/Desk is on/);
+    await until(() => t.state.findLive("/w/d", 92) !== undefined);
+    const topic = t.state.findLive("/w/d", 92)!.topic_id!;
+    await t.router.onUpdate(say("you there?", topic));
+    await until(() => chat.length === 1);
+    expect(chat[0].content).toBe("you there?");
+    const reply = await client.callTool({ name: "reply", arguments: { text: "here" } }) as { content: { text: string }[] };
+    expect(reply.content[0].text).toBe("sent");
+    await until(() => t.tg.inTopic(topic).includes("🤖 here"));
+    // permission relay works while on
+    await (client as unknown as { notification(n: unknown): Promise<void> }).notification({
+      method: "notifications/claude/channel/permission_request",
+      params: { request_id: "qwert", tool_name: "Bash", description: "List files", input_preview: "{\"command\":\"ls\"}" },
+    });
+    await until(() => t.tg.sent.some((m) => m.buttons));
+    // off: topic closed, row offline
+    const off = await call("desk_off");
+    expect(off.content[0].text).toMatch(/off/i);
+    await until(() => t.tg.closed.includes(topic));
+    expect(t.state.findLive("/w/d", 92)).toBeUndefined();
+    // on again: same topic reopened
+    const on2 = await call("desk_on");
+    expect(on2.isError).toBeFalsy();
+    await until(() => t.tg.reopened.includes(topic));
+  });
+
+  it("desk_on with no desk group reports the daemon's reason instead of pretending", async () => {
+    const t = await setup({ group: false });
+    const { call } = await connect(t, "/w/x", 93);
+    const on = await call("desk_on");
+    expect(on.isError).toBe(true);
+    expect(on.content[0].text).toMatch(/desk_here/);
+  });
+});
+
+describe("desk topic sweep", () => {
+  const seed = (state: SqliteDeskState, db: DatabaseSync, cwd: string, pid: number, topic: number, ageDays?: number) => {
+    const row = state.claim(cwd, pid, cwd, undefined);
+    state.setTopic(row.id, G, topic, cwd);
+    state.setOffline(row.id);
+    if (ageDays !== undefined) db.prepare("UPDATE desk_sessions SET updated_at = datetime('now', ? ) WHERE id = ?").run(`-${ageDays} days`, row.id);
+    return row;
+  };
+
+  it("deletes ended sessions' topics after the TTL, keeps fresh and live ones", async () => {
+    const tg = new FakeTelegram();
+    const { state, db } = memState();
+    state.setGroup(G);
+    const t = await setup({ tg, state });
+    seed(state, db, "/w/old", 1, 201, 8);
+    seed(state, db, "/w/fresh", 2, 202, 1);
+    const live = state.claim("/w/live", 3, "live", undefined);
+    state.setTopic(live.id, G, 203, "live");
+    db.prepare("UPDATE desk_sessions SET updated_at = datetime('now', '-30 days') WHERE id = ?").run(live.id);
+    expect(await t.router.sweepStaleTopics()).toBe(1);
+    expect(tg.deleted).toEqual([{ chat: G, id: 201 }]);
+    const oldRow = state.stale("9999-01-01 00:00:00");
+    expect(oldRow.map((r) => r.cwd)).toEqual(["/w/fresh"]); // the swept row lost its topic
+    expect(state.get(live.id)!.topic_id).toBe(203);
+  });
+
+  it("the TTL comes from topicTtlDays", async () => {
+    const tg = new FakeTelegram();
+    const { state, db } = memState();
+    state.setGroup(G);
+    const router = new DeskRouter({ socketPath: join(tmp(), "d.sock"), ownerId: String(OWNER), telegram: tg, state, log: () => {}, topicTtlDays: 1 });
+    await router.start();
+    cleanups.push(() => router.stop());
+    seed(state, db, "/w/x", 1, 301, 2);
+    expect(await router.sweepStaleTopics()).toBe(1);
+    expect(tg.deleted).toEqual([{ chat: G, id: 301 }]);
+  });
+
+  it("a topic whose deletion fails stays for the next sweep", async () => {
+    const tg = new FakeTelegram();
+    tg.deleteTopic = async () => { throw new Error("telegram deleteForumTopic: boom"); };
+    const { state, db } = memState();
+    state.setGroup(G);
+    const t = await setup({ tg, state });
+    const row = seed(state, db, "/w/stuck", 1, 401, 30);
+    expect(await t.router.sweepStaleTopics()).toBe(0);
+    expect(state.get(row.id)!.topic_id).toBe(401);
+  });
+});
+
+describe("desk install", () => {
+  it("the rc block wraps claude, is guarded, idempotent and removable", () => {
+    const rc = "# my bashrc\nexport X=1\n";
+    const once = installBlock(rc);
+    expect(once).toContain("claude-telegram code");
+    expect(once).toContain("CLAUDE_TELEGRAM_DESK");
+    expect(installBlock(once)).toBe(once);
+    const off = uninstallBlock(once);
+    expect(off).not.toContain(BLOCK_START);
+    expect(off).not.toContain("claude-telegram");
+    expect(off).toContain("export X=1");
+  });
+
+  it("install/uninstall write the rc files that exist and the /desk command", () => {
+    const home = tmp();
+    writeFileSync(join(home, ".bashrc"), "# rc\n");
+    const r = install(home);
+    expect(readFileSync(join(home, ".bashrc"), "utf8")).toContain(BLOCK_START);
+    expect(r.skipped).toContain(join(home, ".zshrc"));
+    const cmd = join(home, ".claude", "commands", "desk.md");
+    expect(readFileSync(cmd, "utf8")).toContain("mcp__claude-telegram__desk_on");
+    expect(readFileSync(cmd, "utf8")).toContain("mcp__claude-telegram__desk_off");
+    const u = uninstall(home);
+    expect(readFileSync(join(home, ".bashrc"), "utf8")).not.toContain(BLOCK_START);
+    expect(existsSync(cmd)).toBe(false);
+    expect(u.changed).toContain(cmd);
+  });
+});
+
 describe("desk launcher", () => {
   it("passes both variadic flags in --flag=value form before the user's own arguments", () => {
     expect(claudeArgs("/d/desk-mcp.json", ["--model", "opus", "fix the bug"])).toEqual([
-      "--mcp-config=/d/desk-mcp.json", "--dangerously-load-development-channels=server:claude-telegram", "--allowedTools=mcp__claude-telegram__reply",
+      "--mcp-config=/d/desk-mcp.json", "--dangerously-load-development-channels=server:claude-telegram",
+      "--allowedTools=mcp__claude-telegram__reply,mcp__claude-telegram__desk_on,mcp__claude-telegram__desk_off",
       "--model", "opus", "fix the bug"]);
   });
 
@@ -1019,7 +1188,7 @@ describe("final review: the channel never cuts a field", () => {
   it("a field over 64 KB is sent as too long: shown as answer-in-the-terminal, no buttons, not answerable", async () => {
     const t = await setup();
     const [clientT, serverT] = InMemoryTransport.createLinkedPair();
-    const ch = await startDeskChannel({ socketPath: t.socketPath, hello: { type: "hello", cwd: "/w/proj", pid: 77, title: "proj" }, transport: serverT });
+    const ch = await startDeskChannel({ socketPath: t.socketPath, hello: { type: "hello", cwd: "/w/proj", pid: 77, title: "proj" }, transport: serverT, autostart: true });
     cleanups.push(() => ch.close());
     const client = new Client({ name: "claude-code", version: "1" });
     await client.connect(clientT);
@@ -1040,7 +1209,7 @@ describe("final review: /desk_off then /desk_here leaves sessions working", () =
   it("the reply tool works again and a prompt shown before can still be answered", async () => {
     const t = await setup();
     const [clientT, serverT] = InMemoryTransport.createLinkedPair();
-    const ch = await startDeskChannel({ socketPath: t.socketPath, hello: { type: "hello", cwd: "/w/proj", pid: 78, title: "proj" }, transport: serverT });
+    const ch = await startDeskChannel({ socketPath: t.socketPath, hello: { type: "hello", cwd: "/w/proj", pid: 78, title: "proj" }, transport: serverT, autostart: true });
     cleanups.push(() => ch.close());
     const client = new Client({ name: "claude-code", version: "1" });
     const verdicts: unknown[] = [];
@@ -1289,7 +1458,7 @@ describe("security review: local denial of service is bounded", () => {
   it("the channel checks a message's encoded size: control characters can't push it past the line limit", async () => {
     const t = await setup();
     const [clientT, serverT] = InMemoryTransport.createLinkedPair();
-    const ch = await startDeskChannel({ socketPath: t.socketPath, hello: { type: "hello", cwd: "/w/proj", pid: 79, title: "proj" }, transport: serverT });
+    const ch = await startDeskChannel({ socketPath: t.socketPath, hello: { type: "hello", cwd: "/w/proj", pid: 79, title: "proj" }, transport: serverT, autostart: true });
     cleanups.push(() => ch.close());
     const client = new Client({ name: "claude-code", version: "1" });
     await client.connect(clientT);

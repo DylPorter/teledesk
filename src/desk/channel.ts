@@ -22,9 +22,10 @@ export const ENV_GUARD = "CLAUDE_TELEGRAM_DESK";
 export const REFUSAL = `claude-telegram desk-channel: not starting, because ${ENV_GUARD}=1 isn't set. This server only runs inside a session started with \`claude-telegram code\`, which sets it.\n`;
 
 export const INSTRUCTIONS = [
-  `The owner can also talk to this session from their phone. Their messages arrive as <channel source="${CHANNEL_NAME}" message_id="...">text</channel>; claude-telegram only passes on text the owner wrote themselves, from their own Telegram account (forwarded messages are never passed on).`,
+  "The owner can talk to this session from Telegram while its desk topic is on. They turn it on with /desk (which calls the desk_on tool) and off with /desk off (desk_off). While it's off, reply is unavailable and permission prompts go to the terminal only.",
+  `While the topic is on, their messages arrive as <channel source="${CHANNEL_NAME}" message_id="...">text</channel>; claude-telegram only passes on text the owner wrote themselves, from their own Telegram account (forwarded messages are never passed on).`,
   "They read Telegram, not this terminal: anything you want them to see must go through the reply tool. Your normal transcript output never reaches them.",
-  "This session has its own Telegram topic, so reply takes just the text. Use plain text (no Markdown rendering); long replies are split automatically.",
+  "The topic is this session's own, so reply takes just the text. Use plain text (no Markdown rendering); long replies are split automatically.",
   "Answer a channel message with reply, even briefly, so they know you got it.",
 ].join("\n");
 
@@ -38,6 +39,7 @@ export interface LinkHandlers {
   onMessage(text: string, messageId: number): void;
   onVerdict(requestId: string, behavior: "allow" | "deny"): void;
   onWelcome?(sessionId: number, topicName: string): void;
+  onError?(reason: string): void;
 }
 
 /** The socket to the daemon: reconnects with backoff while it's down, says hello on every
@@ -61,7 +63,7 @@ export class DaemonLink {
 
   get isConnected(): boolean { return this.connected; }
 
-  start(): void { this.connect(); }
+  start(): void { this.closing = false; this.delay = this.backoff.min; this.connect(); }
 
   /** Try again later, backing off while the daemon stays away. */
   private retry(): void {
@@ -111,7 +113,7 @@ export class DaemonLink {
     const m = decode(DaemonMessage, line);
     if (!m) { this.log("ignored a malformed message from the daemon"); return; }
     if (m.type === "welcome") { this.welcomed = true; this.lastError = undefined; this.h.onWelcome?.(m.session_id, m.topic_name); }
-    else if (m.type === "error") { this.lastError = m.reason; this.log(`daemon: ${m.reason}`); }
+    else if (m.type === "error") { this.lastError = m.reason; this.log(`daemon: ${m.reason}`); this.h.onError?.(m.reason); }
     else if (m.type === "message") this.h.onMessage(m.text, m.message_id);
     else this.h.onVerdict(m.request_id, m.behavior);
   }
@@ -124,18 +126,25 @@ export class DaemonLink {
     return "queued";
   }
 
-  /** Say bye (if connected) and stop reconnecting. */
-  async close(): Promise<void> {
+  /** Say bye (if connected) and stop reconnecting; `start()` can bring the link back later
+   * (desk_off then desk_on), and `close()` at process exit is the same thing permanently. */
+  async detach(): Promise<void> {
     this.closing = true;
     clearTimeout(this.timer);
     const sock = this.sock;
-    if (!sock || !this.connected) { sock?.destroy(); return; }
+    this.queue = [];
+    if (!sock || !this.connected) { sock?.destroy(); this.sock = undefined; this.connected = false; this.welcomed = false; return; }
     await new Promise<void>((r) => {
       const t = setTimeout(() => { sock.destroy(); r(); }, 1000);
       sock.once("close", () => { clearTimeout(t); r(); });
       sock.end(encode({ type: "bye" }));
     });
+    this.connected = false;
+    this.welcomed = false;
   }
+
+  /** Say bye (if connected) and stop reconnecting. */
+  async close(): Promise<void> { await this.detach(); }
 }
 
 const PermissionRequest = z.object({
@@ -145,8 +154,17 @@ const PermissionRequest = z.object({
 
 export interface DeskChannel { server: Server; link: DaemonLink; close(): Promise<void> }
 
-/** Build the MCP server and the daemon link, and connect the server to `transport`. */
-export async function startDeskChannel(o: { socketPath: string; hello: Hello; transport: Transport; log?: (m: string) => void; backoff?: { min: number; max: number } }): Promise<DeskChannel> {
+/** What desk_on resolves to: the topic, the daemon's reason there isn't one, or no daemon. */
+type Activation = { kind: "welcome"; topic: string } | { kind: "error"; reason: string } | { kind: "unreachable" };
+
+/** How long desk_on waits for the daemon's welcome or error before reporting "unreachable". */
+const ACTIVATE_TIMEOUT_MS = 15_000;
+
+/** Build the MCP server and the daemon link, and connect the server to `transport`. The link
+ * stays dormant (never dials the daemon, no topic) until the desk_on tool — what the owner's
+ * /desk runs — unless `autostart` is set. Dormant means: replies refused, permission prompts
+ * left to the terminal, nothing reaches Telegram. */
+export async function startDeskChannel(o: { socketPath: string; hello: Hello; transport: Transport; log?: (m: string) => void; backoff?: { min: number; max: number }; autostart?: boolean }): Promise<DeskChannel> {
   const log = o.log ?? (() => {});
   const server = new Server({ name: CHANNEL_NAME, version: "1.0.0" }, {
     capabilities: { experimental: { "claude/channel": {}, "claude/channel/permission": {} }, tools: {} },
@@ -154,6 +172,11 @@ export async function startDeskChannel(o: { socketPath: string; hello: Hello; tr
   });
   /** Permission requests this session really made: a verdict for any other id is dropped here. */
   const open = new Set<string>();
+  /** On from desk_on (or autostart) until desk_off: gates the link, replies and prompt relays. */
+  let activated = o.autostart === true;
+  let topicName: string | undefined;
+  let waiters: ((r: Activation) => void)[] = [];
+  const flush = (r: Activation) => { const w = waiters; waiters = []; for (const f of w) f(r); };
   const link = new DaemonLink(o.socketPath, o.hello, {
     onMessage: (text, messageId) => {
       server.notification({ method: "notifications/claude/channel", params: { content: text, meta: { message_id: String(messageId) } } })
@@ -164,27 +187,73 @@ export async function startDeskChannel(o: { socketPath: string; hello: Hello; tr
       server.notification({ method: "notifications/claude/channel/permission", params: { request_id: requestId, behavior } })
         .catch((e) => log(`couldn't deliver a verdict: ${(e as Error).message}`));
     },
+    onWelcome: (_sessionId, name) => { topicName = name; flush({ kind: "welcome", topic: name }); },
+    onError: (reason) => flush({ kind: "error", reason }),
   }, log, o.backoff);
 
+  /** Dial in (or reuse a live link) and wait for the daemon's welcome or error. */
+  const activate = (): Promise<Activation> => {
+    if (link.isConnected && link.welcomed && topicName !== undefined) return Promise.resolve({ kind: "welcome", topic: topicName });
+    if (link.isConnected && link.lastError) return Promise.resolve({ kind: "error", reason: link.lastError });
+    link.start();
+    const answered = new Promise<Activation>((resolve) => { waiters.push(resolve); });
+    const timedOut = new Promise<Activation>((resolve) => {
+      const t = setTimeout(() => resolve(link.isConnected ? { kind: "error", reason: "the daemon didn't answer in time" } : { kind: "unreachable" }), ACTIVATE_TIMEOUT_MS);
+      t.unref?.();
+    });
+    return Promise.race([answered, timedOut]);
+  };
+
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: [{
-      name: "reply",
-      description: "Send a message to the owner in this session's Telegram topic. Plain text; long text is split automatically.",
-      inputSchema: { type: "object", properties: { text: { type: "string", description: "The message" } }, required: ["text"] },
-    }],
+    tools: [
+      {
+        name: "reply",
+        description: "Send a message to the owner in this session's Telegram topic (works while the desk is on). Plain text; long text is split automatically.",
+        inputSchema: { type: "object", properties: { text: { type: "string", description: "The message" } }, required: ["text"] },
+      },
+      {
+        name: "desk_on",
+        description: "Open this session's Telegram topic so the owner can talk to it from their phone. This is what the owner's /desk runs.",
+        inputSchema: { type: "object", properties: {} },
+      },
+      {
+        name: "desk_off",
+        description: "Close this session's Telegram topic. This is what the owner's /desk off runs.",
+        inputSchema: { type: "object", properties: {} },
+      },
+    ],
   }));
   server.setRequestHandler(CallToolRequestSchema, async (req) => {
     const fail = (t: string) => ({ content: [{ type: "text" as const, text: t }], isError: true });
+    const ok = (t: string) => ({ content: [{ type: "text" as const, text: t }] });
+    if (req.params.name === "desk_on") {
+      if (activated && link.welcomed && topicName !== undefined) return ok(`Desk is already on: this session's topic is "${topicName}".`);
+      activated = true;
+      const r = await activate();
+      if (r.kind === "welcome") return ok(`Desk is on: this session's topic is "${r.topic}". The owner reads Telegram, not this terminal: anything they should see goes through the reply tool.`);
+      if (r.kind === "unreachable") return ok("Desk is on, but the claude-telegram daemon isn't reachable right now; the topic opens as soon as it is.");
+      return fail(`Desk couldn't open a topic: ${r.reason}`);
+    }
+    if (req.params.name === "desk_off") {
+      if (!activated) return ok("Desk is already off.");
+      activated = false;
+      topicName = undefined;
+      await link.detach();
+      return ok("Desk is off: the topic is closed and permission prompts are terminal-only again.");
+    }
     if (req.params.name !== "reply") return fail(`unknown tool: ${req.params.name}`);
     const text = (req.params.arguments as { text?: unknown } | undefined)?.text;
     if (typeof text !== "string" || !text.trim()) return fail("reply needs non-empty text");
     if (Buffer.byteLength(text, "utf8") > MAX_TEXT_BYTES || !fits({ type: "reply", text })) return fail(`That's too long to send in one piece (${MAX_TEXT_BYTES / 1024} KB at most); send it in parts.`);
+    if (!activated) return fail("Desk is off in this session: nothing reaches the owner's Telegram. They can turn it on with /desk.");
     if (link.isConnected && link.lastError) return fail(`Not sent: ${link.lastError}`);
     const r = link.send({ type: "reply", text });
     if (r === "dropped") return fail("Not sent: the claude-telegram daemon isn't reachable and too many messages are already waiting.");
-    return { content: [{ type: "text" as const, text: r === "sent" ? "sent" : "queued: the claude-telegram daemon isn't reachable right now; this goes out when it's back" }] };
+    return ok(r === "sent" ? "sent" : "queued: the claude-telegram daemon isn't reachable right now; this goes out when it's back");
   });
   server.setNotificationHandler(PermissionRequest, async ({ params }) => {
+    // Dormant: the terminal is the only place this prompt exists; there's nothing to relay.
+    if (!activated) return;
     if (!REQUEST_ID.test(params.request_id)) { log(`ignored a permission request with an unexpected id`); return; }
     const tool = params.tool_name || "tool";
     const whole: ChannelMessage = { type: "permission_request", request_id: params.request_id, tool_name: tool, description: params.description, input_preview: params.input_preview };
@@ -199,7 +268,7 @@ export async function startDeskChannel(o: { socketPath: string; hello: Hello; tr
   });
 
   await server.connect(o.transport);
-  link.start();
+  if (activated) link.start();
   return { server, link, close: async () => { await link.close(); await server.close().catch(() => undefined); } };
 }
 

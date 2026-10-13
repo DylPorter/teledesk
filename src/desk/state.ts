@@ -74,4 +74,10 @@ export class SqliteDeskState implements DeskState {
   byTopic(groupId: string, topicId: number): DeskSessionRow | undefined {
     return this.db.prepare("SELECT * FROM desk_sessions WHERE group_id = ? AND topic_id = ? ORDER BY id DESC LIMIT 1").get(groupId, topicId) as DeskSessionRow | undefined;
   }
+  stale(cutoff: string): DeskSessionRow[] {
+    return this.db.prepare("SELECT * FROM desk_sessions WHERE status = 'offline' AND topic_id IS NOT NULL AND group_id IS NOT NULL AND updated_at < ? ORDER BY id").all(cutoff) as unknown as DeskSessionRow[];
+  }
+  clearTopic(id: number): void {
+    this.db.prepare("UPDATE desk_sessions SET topic_id = NULL, topic_name = NULL, group_id = NULL, updated_at = datetime('now') WHERE id = ?").run(id);
+  }
 }

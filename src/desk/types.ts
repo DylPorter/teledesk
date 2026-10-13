@@ -16,6 +16,8 @@ export interface DeskTelegram {
   editTopic(chatId: string, threadId: number, name: string): Promise<void>;
   closeTopic(chatId: string, threadId: number): Promise<void>;
   reopenTopic(chatId: string, threadId: number): Promise<void>;
+  /** Delete a forum topic outright (the stale-topic sweep). */
+  deleteTopic(chatId: string, threadId: number): Promise<void>;
   /** One message (≤ 4096 characters) in a topic (threadId) or the group's General. Resolves to its id. */
   send(chatId: string, threadId: number | undefined, text: string, buttons?: DeskButton[][]): Promise<number>;
   /** Replace a message's text; its buttons go. */
@@ -58,6 +60,10 @@ export interface DeskState {
   setTopic(id: number, groupId: string, topicId: number, name: string): void;
   setOffline(id: number): void;
   byTopic(groupId: string, topicId: number): DeskSessionRow | undefined;
+  /** Offline rows with a topic, untouched since before `cutoff` (UTC 'YYYY-MM-DD HH:MM:SS'). */
+  stale(cutoff: string): DeskSessionRow[];
+  /** Forget a row's topic (after the sweep deleted it). */
+  clearTopic(id: number): void;
 }
 
 export type DeskLog = (message: string) => void;

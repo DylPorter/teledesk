@@ -1,6 +1,6 @@
 # claude-telegram
 
-**Your Claude Code sessions in Telegram topics.** Start Claude Code with `claude-telegram code` and that session gets its own topic in a private Telegram group. To talk to it from your phone, write in the topic. Its replies come back in the topic, and its permission prompts show up there with **Allow** and **Deny** buttons. No commands to learn: each topic is one session, like a chat list.
+**Your Claude Code sessions in Telegram topics.** Start Claude Code with `claude-telegram code` (or run `claude-telegram install` once and plain `claude` works too), then send **`/desk`** inside a session: it gets its own topic in a private Telegram group. To talk to that session from your phone, write in its topic. Its replies come back in the topic, and its permission prompts show up there with **Allow** and **Deny** buttons. Until you send `/desk`, the session stays off Telegram entirely — no topic, no noise. Each topic is one session, like a chat list.
 
 ```
 your terminal                          your phone
@@ -32,10 +32,11 @@ It uses Claude Code [channels](https://code.claude.com/docs/en/channels-referenc
    - Don't post as the group ("Remain anonymous"); those messages are ignored.
    - Send **`/desk_here`** in the group. The bot either confirms or tells you what's missing. `/desk_off` turns it off again.
 5. **Start sessions.** Put `bin/` on your PATH (or symlink `bin/claude-telegram`), then run `claude-telegram code` in any folder, with any `claude` arguments after it.
-   - A topic named `<folder> · <branch>` appears.
-   - A second session in the same folder gets `#2`.
-   - The same folder later gets its topic back.
-   - Optional: `alias claude='claude-telegram code'`. Non-interactive runs (`-p`, `--output-format`, `--version`, `mcp …`, `update` and the other subcommands) are passed straight to plain `claude` without the channel.
+   - The session starts **dormant**: nothing on Telegram yet.
+   - Send **`/desk`** inside the session: a topic named `<folder> · <branch>` appears in the desk group. `/desk off` closes it again.
+   - A second session in the same folder gets `#2`. The same folder later gets its topic back.
+   - Optional, recommended: **`claude-telegram install`** wraps plain `claude` in your shell (a guarded function in `.bashrc`/`.zshrc`, removable with `claude-telegram uninstall`) and installs the `/desk` command for Claude Code. Non-interactive runs (`-p`, `--output-format`, `--version`, `mcp …`, `update` and the other subcommands) are passed straight to plain `claude` without the channel.
+6. **Topic sweep.** Topics of ended sessions are deleted after 7 days without activity (`DESK_TOPIC_TTL_DAYS` in `.env` sets the TTL; the sweep runs hourly). Transcripts on your machine are untouched — the group just doesn't become a graveyard.
 
 Message the bot directly for a short help text and the list of live sessions.
 

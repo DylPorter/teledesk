@@ -14,6 +14,8 @@ const CONFIG_ERROR = 78;
 const Env = z.object({
   TELEGRAM_BOT_TOKEN: z.string().min(1),
   TELEGRAM_ALLOWED_USER_ID: z.string().regex(/^\d+$/, "must be a numeric Telegram user id"),
+  /** Ended sessions' topics are deleted after this many days without activity. */
+  DESK_TOPIC_TTL_DAYS: z.coerce.number().int().min(1).max(365).optional(),
 });
 const parsed = Env.safeParse(process.env);
 if (!parsed.success) {
@@ -28,6 +30,7 @@ if (!parsed.success) {
 const log = (m: string) => process.stderr.write(`${new Date().toISOString()} ${m}\n`);
 const daemon = new DeskDaemon({
   token: parsed.data.TELEGRAM_BOT_TOKEN, ownerId: parsed.data.TELEGRAM_ALLOWED_USER_ID, paths: deskPaths(), log,
+  topicTtlDays: parsed.data.DESK_TOPIC_TTL_DAYS,
   onFatal: () => { void daemon.stop().finally(() => process.exit(CONFIG_ERROR)); },
 });
 

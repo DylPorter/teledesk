@@ -15,7 +15,7 @@ import type { DeskLog, DeskSessionRow, DeskState, DeskTelegram, DeskUpdate } fro
 export const NO_SESSION_TEXT = "No Claude Code session is open for this folder. Start one with `claude-telegram code` there.";
 export const RECONNECTING_TEXT = "This session is reconnecting to the claude-telegram daemon. Send that again in a few seconds.";
 export const NO_GROUP_REASON = "No desk group is set up. In Telegram: create a group, turn on Topics, add the bot as an admin with Manage topics, then send /desk_here in the group.";
-export const GENERAL_HINT = "Each `claude-telegram code` session gets its own topic here. Write in that session's topic.";
+export const GENERAL_HINT = "A session's topic opens when /desk turns its desk on (sessions started via `claude-telegram code` or the shell hook). Write in a session's topic to talk to it.";
 export const FORWARD_TEXT = "Forwarded messages aren't passed to the session. Paste the text if you want it acted on.";
 export const TEXT_ONLY = "Only text messages reach the session for now.";
 export const EARLIER_SESSION = "This prompt belongs to an earlier session.";
@@ -106,6 +106,8 @@ export interface DeskRouterOptions {
   helloTimeoutMs?: number;
   /** Wait before retrying a failed topic creation. */
   retryMs?: number;
+  /** Ended sessions' topics are deleted after this many days without activity (default 7). */
+  topicTtlDays?: number;
   limits?: Partial<DeskLimits>;
 }
 
@@ -553,6 +555,24 @@ export class DeskRouter {
     await this.tg.send(this.opts.ownerId, undefined, text).catch((e) => this.log(`desk: couldn't tell the owner about group ${chat}: ${errText(e)}`));
   }
 
+  /** Delete ended sessions' topics that nothing touched for the TTL (default 7 days): the
+   * transcripts are local and stay, but an endless list of dead topics buries the live ones.
+   * A topic whose deletion fails is left for the next sweep. Returns how many were deleted. */
+  async sweepStaleTopics(now = new Date()): Promise<number> {
+    const ttlDays = this.opts.topicTtlDays ?? 7;
+    const cutoff = new Date(now.getTime() - ttlDays * 86_400_000).toISOString().slice(0, 19).replace("T", " ");
+    let swept = 0;
+    for (const row of this.state.stale(cutoff)) {
+      if (!row.group_id || row.topic_id === null) continue;
+      try { await this.tg.deleteTopic(row.group_id, row.topic_id); }
+      catch (e) { this.log(`desk: couldn't delete stale topic ${row.topic_id}: ${errText(e)}`); continue; }
+      this.state.clearTopic(row.id);
+      swept++;
+    }
+    if (swept) this.log(`desk: swept ${swept} stale topic(s)`);
+    return swept;
+  }
+
   // ---- Telegram updates from groups ----
   /** Every group update the bot's poll loop sees. Updates are handled one at a time in the
    * order they arrive; the returned promise settles when this one is done. Never rejects. */
@@ -579,6 +599,10 @@ export class DeskRouter {
     const chat = String(u.chatId);
     if (String(u.fromId) !== this.opts.ownerId) {
       if (u.kind === "callback") await this.tg.answerCallback(u.id).catch(() => undefined);
+      // Bot messages aren't readers: the session's own replies to a topic echo back as updates
+      // from this bot, and posts "as the group" arrive from GroupAnonymousBot. Treating those as
+      // intruders turned the desk off on its own confirmation message.
+      else if (u.fromIsBot || u.senderChat) return;
       const who = String(u.fromId ?? "unknown");
       this.logOnce(this.loggedSenders, who, `desk: ignored a group update from user ${who} (only the owner's count)`);
       // Never relayed, but it means someone else can read the desk group.
@@ -701,7 +725,7 @@ export class DeskRouter {
     }
     this.state.setGroup(chatId);
     this.log(`desk: group ${chatId} is now the desk group`);
-    await this.post(chatId, threadId, "✅ This is the desk group now. Each `claude-telegram code` session gets its own topic here.");
+    await this.post(chatId, threadId, "✅ This is the desk group now. In any Claude session started through claude-telegram, /desk opens its topic here.");
     // Every live session: a new topic if it was elsewhere, otherwise a fresh welcome, which also
     // clears an error a session got while desk was off.
     for (const c of this.conns) if (c.hello && !c.ended) void this.lock(c.hello.cwd, () => this.attach(c));
