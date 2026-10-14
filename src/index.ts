@@ -1,4 +1,4 @@
-/** claude-telegram daemon entry: `npm start` (or the systemd unit). Reads .env from the repo
+/** teledesk daemon entry: `npm start` (or the systemd unit). Reads .env from the repo
  * folder: TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_USER_ID (the owner's Telegram user id). */
 import { join } from "node:path";
 import { config } from "dotenv";
@@ -22,7 +22,7 @@ if (!parsed.success) {
   // Names only: never the values.
   for (const i of parsed.error.issues) {
     const name = String(i.path[0]);
-    process.stderr.write(`claude-telegram: ${name} ${process.env[name] ? i.message : "is missing"} (set it in .env)\n`);
+    process.stderr.write(`teledesk: ${name} ${process.env[name] ? i.message : "is missing"} (set it in .env)\n`);
   }
   process.exit(CONFIG_ERROR);
 }
@@ -38,11 +38,11 @@ let stopping = false;
 const stop = (sig: string) => {
   if (stopping) return;
   stopping = true;
-  log(`claude-telegram: stopping (${sig})`);
+  log(`teledesk: stopping (${sig})`);
   setTimeout(() => process.exit(0), 5000).unref();
   void daemon.stop().finally(() => process.exit(0));
 };
 for (const s of ["SIGTERM", "SIGINT", "SIGHUP"] as const) process.on(s, () => stop(s));
 
 try { await daemon.start(); }
-catch (e) { log(`claude-telegram: couldn't start: ${(e as Error).message}`); process.exit(CONFIG_ERROR); }
+catch (e) { log(`teledesk: couldn't start: ${(e as Error).message}`); process.exit(CONFIG_ERROR); }

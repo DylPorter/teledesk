@@ -1,4 +1,4 @@
-/** The channel server for one Claude Code session (`claude-telegram desk-channel`): a stdio
+/** The channel server for one Claude Code session (`teledesk desk-channel`): a stdio
  * MCP server that Claude Code loads as a channel (research preview, see
  * https://code.claude.com/docs/en/channels-reference). It connects to the daemon's
  * desk socket and relays: the owner's Telegram messages → this session, replies and
@@ -17,13 +17,13 @@ import { DaemonMessage, decode, encode, LineReader, MAX_LINE_BYTES, MAX_TEXT_BYT
 /** Whether a message fits in one protocol line once encoded (JSON escaping can grow text). */
 const fits = (m: ChannelMessage) => Buffer.byteLength(encode(m), "utf8") <= MAX_LINE_BYTES;
 
-export const CHANNEL_NAME = "claude-telegram";
-export const ENV_GUARD = "CLAUDE_TELEGRAM_DESK";
-export const REFUSAL = `claude-telegram desk-channel: not starting, because ${ENV_GUARD}=1 isn't set. This server only runs inside a session started with \`claude-telegram code\`, which sets it.\n`;
+export const CHANNEL_NAME = "teledesk";
+export const ENV_GUARD = "TELEDESK";
+export const REFUSAL = `teledesk desk-channel: not starting, because ${ENV_GUARD}=1 isn't set. This server only runs inside a session started with \`teledesk code\`, which sets it.\n`;
 
 export const INSTRUCTIONS = [
   "The owner can talk to this session from Telegram while its desk topic is on. They turn it on with /desk (which calls the desk_on tool) and off with /desk off (desk_off). While it's off, reply is unavailable and permission prompts go to the terminal only.",
-  `While the topic is on, their messages arrive as <channel source="${CHANNEL_NAME}" message_id="...">text</channel>; claude-telegram only passes on text the owner wrote themselves, from their own Telegram account (forwarded messages are never passed on).`,
+  `While the topic is on, their messages arrive as <channel source="${CHANNEL_NAME}" message_id="...">text</channel>; teledesk only passes on text the owner wrote themselves, from their own Telegram account (forwarded messages are never passed on).`,
   "They read Telegram, not this terminal: anything you want them to see must go through the reply tool. Your normal transcript output never reaches them.",
   "The topic is this session's own, so reply takes just the text. Use plain text (no Markdown rendering); long replies are split automatically.",
   "Answer a channel message with reply, even briefly, so they know you got it.",
@@ -231,7 +231,7 @@ export async function startDeskChannel(o: { socketPath: string; hello: Hello; tr
       activated = true;
       const r = await activate();
       if (r.kind === "welcome") return ok(`Desk is on: this session's topic is "${r.topic}". The owner reads Telegram, not this terminal: anything they should see goes through the reply tool.`);
-      if (r.kind === "unreachable") return ok("Desk is on, but the claude-telegram daemon isn't reachable right now; the topic opens as soon as it is.");
+      if (r.kind === "unreachable") return ok("Desk is on, but the teledesk daemon isn't reachable right now; the topic opens as soon as it is.");
       return fail(`Desk couldn't open a topic: ${r.reason}`);
     }
     if (req.params.name === "desk_off") {
@@ -248,8 +248,8 @@ export async function startDeskChannel(o: { socketPath: string; hello: Hello; tr
     if (!activated) return fail("Desk is off in this session: nothing reaches the owner's Telegram. They can turn it on with /desk.");
     if (link.isConnected && link.lastError) return fail(`Not sent: ${link.lastError}`);
     const r = link.send({ type: "reply", text });
-    if (r === "dropped") return fail("Not sent: the claude-telegram daemon isn't reachable and too many messages are already waiting.");
-    return ok(r === "sent" ? "sent" : "queued: the claude-telegram daemon isn't reachable right now; this goes out when it's back");
+    if (r === "dropped") return fail("Not sent: the teledesk daemon isn't reachable and too many messages are already waiting.");
+    return ok(r === "sent" ? "sent" : "queued: the teledesk daemon isn't reachable right now; this goes out when it's back");
   });
   server.setNotificationHandler(PermissionRequest, async ({ params }) => {
     // Dormant: the terminal is the only place this prompt exists; there's nothing to relay.
@@ -280,11 +280,11 @@ export function gitBranch(cwd: string): string | undefined {
   } catch { return undefined; }
 }
 
-/** `claude-telegram desk-channel`: refuses without CLAUDE_TELEGRAM_DESK=1; otherwise serves on stdio until
+/** `teledesk desk-channel`: refuses without TELEDESK=1; otherwise serves on stdio until
  * Claude Code closes it. Returns the exit code. */
 export async function runDeskChannel(socketPath: string, env: NodeJS.ProcessEnv = process.env): Promise<number> {
   if (env[ENV_GUARD] !== "1") { process.stderr.write(REFUSAL); return 1; }
-  const log = (m: string) => process.stderr.write(`claude-telegram desk-channel: ${m}\n`);
+  const log = (m: string) => process.stderr.write(`teledesk desk-channel: ${m}\n`);
   process.on("unhandledRejection", (e) => log(`unhandled rejection: ${String(e)}`));
   // A half-working channel is worse than a failed one: Claude Code shows the failure.
   process.on("uncaughtException", (e) => { log(`uncaught exception: ${String(e)}`); process.exit(1); });

@@ -1,11 +1,11 @@
 {
-  "name": "claude-telegram",
+  "name": "teledesk",
   "version": "0.1.0",
   "description": "Your Claude Code sessions in Telegram topics",
   "private": true,
   "type": "module",
   "bin": {
-    "claude-telegram": "bin/claude-telegram"
+    "teledesk": "bin/teledesk"
   },
   "engines": {
     "node": ">=22.13"

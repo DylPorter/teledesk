@@ -1,4 +1,4 @@
-/** The claude-telegram daemon: one Telegram bot, one desk router. Group updates go to
+/** The teledesk daemon: one Telegram bot, one desk router. Group updates go to
  * the router; a direct message from the owner gets a short help reply with the live
  * sessions. Anyone else's direct messages are ignored. */
 import { DatabaseSync } from "node:sqlite";
@@ -6,7 +6,7 @@ import { BotApi } from "./desk/bot-api.js";
 import { DeskRouter } from "./desk/router.js";
 import { SqliteDeskState, sqliteMeta } from "./desk/state.js";
 import type { DeskState, DeskTelegram } from "./desk/types.js";
-import { ensureDataDir, type DeskPaths } from "./paths.js";
+import { ensureDataDir, migrateLegacyDataDir, type DeskPaths } from "./paths.js";
 import { classify, Poller, type RawUpdate } from "./poll.js";
 
 export interface DaemonOptions {
@@ -39,7 +39,7 @@ export function helpText(state: DeskState): string {
     "2. Make the bot an admin with the Manage topics right.",
     "3. Send /desk_here in the group.",
     "",
-    "Then start Claude Code with `claude-telegram code` (or run `claude-telegram install` once and plain `claude` works too). Inside a session, /desk opens its topic here: write there to talk to it, and its permission prompts show up there with Allow and Deny. /desk off closes it.",
+    "Then start Claude Code with `teledesk code` (or run `teledesk install` once and plain `claude` works too). Inside a session, /desk opens its topic here: write there to talk to it, and its permission prompts show up there with Allow and Deny. /desk off closes it.",
     "",
     "Topics of ended sessions are deleted after 7 days of inactivity (DESK_TOPIC_TTL_DAYS); the transcripts on this machine are untouched.",
     "",
@@ -69,6 +69,8 @@ export class DeskDaemon {
 
   async start(): Promise<void> {
     const { paths, log } = this.o;
+    const moved = migrateLegacyDataDir(paths); // the pre-rename folder, once
+    if (moved) log(`teledesk: moved the data folder from ${moved}`);
     ensureDataDir(paths.dataDir); // throws if the folder isn't safe, before anything is opened in it
     this.db = new DatabaseSync(paths.db);
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;");
@@ -76,16 +78,16 @@ export class DeskDaemon {
     this.router = new DeskRouter({ socketPath: paths.socket, ownerId: this.o.ownerId, telegram: this.tg, state: this.state, log, alive: this.o.alive, graceMs: this.o.graceMs, topicTtlDays: this.o.topicTtlDays });
     try { await this.router.start(); }
     catch (e) { this.db.close(); this.db = undefined; throw e; }
-    const sweep = () => void this.router?.sweepStaleTopics().catch((e: Error) => log(`claude-telegram: topic sweep failed: ${e.message}`));
+    const sweep = () => void this.router?.sweepStaleTopics().catch((e: Error) => log(`teledesk: topic sweep failed: ${e.message}`));
     sweep();
     this.sweepTimer = setInterval(sweep, SWEEP_EVERY_MS);
     this.sweepTimer.unref();
     const poller = this.o.poller ?? new Poller(this.o.token!, log);
     this.polling = poller.run((u) => this.onUpdate(u), this.abort.signal).catch((e: Error) => {
-      log(`claude-telegram: polling stopped: ${e.message}`);
+      log(`teledesk: polling stopped: ${e.message}`);
       this.o.onFatal?.(e);
     });
-    log(`claude-telegram: listening on ${paths.socket}`);
+    log(`teledesk: listening on ${paths.socket}`);
   }
 
   /** One raw update. Never waits on Telegram, so the poll loop keeps moving. */
@@ -96,11 +98,11 @@ export class DeskDaemon {
     if (c.kind === "dm-callback") { void this.tg.answerCallback(c.id).catch(() => undefined); return; }
     if (String(c.fromId) !== this.o.ownerId) {
       const who = String(c.fromId ?? "unknown");
-      if (!this.loggedDm.has(who)) { if (this.loggedDm.size >= 1000) this.loggedDm.clear(); this.loggedDm.add(who); this.o.log(`claude-telegram: ignored a direct message from user ${who} (only the owner's count)`); }
+      if (!this.loggedDm.has(who)) { if (this.loggedDm.size >= 1000) this.loggedDm.clear(); this.loggedDm.add(who); this.o.log(`teledesk: ignored a direct message from user ${who} (only the owner's count)`); }
       return;
     }
     if (!this.state) return;
-    void this.tg.send(String(c.chatId), undefined, helpText(this.state)).catch((e: Error) => this.o.log(`claude-telegram: couldn't answer a direct message: ${e.message}`));
+    void this.tg.send(String(c.chatId), undefined, helpText(this.state)).catch((e: Error) => this.o.log(`teledesk: couldn't answer a direct message: ${e.message}`));
   }
 
   /** Stop polling and close the socket. Open sessions aren't ended: their channel servers keep

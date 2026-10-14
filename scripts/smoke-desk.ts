@@ -1,4 +1,4 @@
-/** Smoke test: spawn `bin/claude-telegram desk-channel` over real stdio, the way Claude Code
+/** Smoke test: spawn `bin/teledesk desk-channel` over real stdio, the way Claude Code
  * does, against a real desk router with a fake Telegram. Checks start-up, an owner message
  * reaching the session, a reply reaching the topic, a permission prompt answered by a tap,
  * and the topic closing when the session exits. Touches no real bot and no real data folder.
@@ -43,8 +43,8 @@ const wait = async (what: string, f: () => boolean) => {
 const ok = (m: string) => console.log(`✓ ${m}`);
 
 const transport = new StdioClientTransport({
-  command: join(REPO_ROOT, "bin", "claude-telegram"), args: ["desk-channel"], stderr: "inherit",
-  env: { ...process.env as Record<string, string>, CLAUDE_TELEGRAM_DESK: "1", CLAUDE_TELEGRAM_DATA_DIR: data, CLAUDE_PROJECT_DIR: REPO_ROOT },
+  command: join(REPO_ROOT, "bin", "teledesk"), args: ["desk-channel"], stderr: "inherit",
+  env: { ...process.env as Record<string, string>, TELEDESK: "1", TELEDESK_DATA_DIR: data, CLAUDE_PROJECT_DIR: REPO_ROOT },
 });
 const client = new Client({ name: "smoke", version: "1" });
 const chat: { content: string; meta: Record<string, string> }[] = [];

@@ -1,6 +1,6 @@
-/** Where claude-telegram keeps its files: $CLAUDE_TELEGRAM_DATA_DIR, else
- * $XDG_DATA_HOME/claude-telegram, else ~/.local/share/claude-telegram. */
-import { chmodSync, mkdirSync, statSync } from "node:fs";
+/** Where teledesk keeps its files: $TELEDESK_DATA_DIR, else
+ * $XDG_DATA_HOME/teledesk, else ~/.local/share/teledesk. */
+import { chmodSync, existsSync, mkdirSync, renameSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,14 +13,26 @@ export interface DeskPaths {
   socket: string;
   /** Desk sessions and the desk group id (SQLite). */
   db: string;
-  /** The MCP config `claude-telegram code` hands to Claude Code. */
+  /** The MCP config `teledesk code` hands to Claude Code. */
   mcpConfig: string;
 }
 
 export function deskPaths(env: NodeJS.ProcessEnv = process.env): DeskPaths {
   const xdg = env.XDG_DATA_HOME && isAbsolute(env.XDG_DATA_HOME) ? env.XDG_DATA_HOME : join(homedir(), ".local", "share");
-  const dataDir = env.CLAUDE_TELEGRAM_DATA_DIR || join(xdg, "claude-telegram");
+  const dataDir = env.TELEDESK_DATA_DIR || join(xdg, "teledesk");
   return { dataDir, socket: join(dataDir, "desk.sock"), db: join(dataDir, "desk.db"), mcpConfig: join(dataDir, "desk-mcp.json") };
+}
+
+/** One-time move from the pre-rename folder (~/.local/share/claude-telegram), so the desk
+ * group registration and session rows survive the upgrade. A stale socket in the moved folder
+ * is removed: sockets don't survive a rename as connectable. Returns the old folder if it was
+ * moved, else undefined. */
+export function migrateLegacyDataDir(p: DeskPaths = deskPaths()): string | undefined {
+  const legacy = join(dirname(p.dataDir), "claude-telegram");
+  if (existsSync(p.dataDir) || !existsSync(legacy)) return undefined;
+  renameSync(legacy, p.dataDir);
+  rmSync(join(p.dataDir, "desk.sock"), { force: true });
+  return legacy;
 }
 
 /** Create the data folder owner-only (tightening it if needed) and refuse to use one that another

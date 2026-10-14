@@ -1,4 +1,4 @@
-/** `claude-telegram code [claude args…]`: start interactive Claude Code with the desk channel
+/** `teledesk code [claude args…]`: start interactive Claude Code with the desk channel
  * loaded. Custom channels aren't on the research-preview allowlist, so it's loaded
  * with --dangerously-load-development-channels (Claude Code asks to confirm), from an
  * MCP config passed with --mcp-config. */
@@ -82,7 +82,7 @@ export function runClaude(o: { args: string[]; desk: boolean; claude?: string; e
   return new Promise<number>((resolve) => {
     const done = (code: number) => { process.off("SIGINT", onInt); process.off("SIGTERM", onTerm); process.off("SIGHUP", onHup); resolve(code); };
     child.on("error", (e) => {
-      process.stderr.write((e as NodeJS.ErrnoException).code === "ENOENT" ? "claude-telegram code: `claude` isn't on your PATH.\n" : `claude-telegram code: couldn't start claude: ${e.message}\n`);
+      process.stderr.write((e as NodeJS.ErrnoException).code === "ENOENT" ? "teledesk code: `claude` isn't on your PATH.\n" : `teledesk code: couldn't start claude: ${e.message}\n`);
       done(127);
     });
     child.on("exit", (code, signal) => done(code ?? (signal ? 128 + (constants.signals[signal] ?? 1) : 0)));

@@ -1,9 +1,9 @@
-# claude-telegram daemon: your Claude Code sessions in Telegram topics.
+# teledesk daemon: your Claude Code sessions in Telegram topics.
 # Install (user unit): copy to ~/.config/systemd/user/, set WorkingDirectory to your clone,
-# then: systemctl --user daemon-reload && systemctl --user enable --now claude-telegram
+# then: systemctl --user daemon-reload && systemctl --user enable --now teledesk
 # Reads TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_USER_ID from .env in WorkingDirectory.
 [Unit]
-Description=claude-telegram: Claude Code sessions in Telegram topics
+Description=teledesk: Claude Code sessions in Telegram topics
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=300
@@ -11,7 +11,7 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-WorkingDirectory=%h/claude-telegram
+WorkingDirectory=%h/teledesk
 ExecStart=/usr/bin/env node --no-warnings=ExperimentalWarning --import tsx src/index.ts
 Restart=on-failure
 RestartSec=5

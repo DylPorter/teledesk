@@ -12,10 +12,10 @@ import { ChannelMessage, clip, decode, encode, LineReader, oneLine, VERDICT_TEXT
 import { CHUNK, cleanText, INVISIBLE, promptMessages, tooLongText } from "./prompt.js";
 import type { DeskLog, DeskSessionRow, DeskState, DeskTelegram, DeskUpdate } from "./types.js";
 
-export const NO_SESSION_TEXT = "No Claude Code session is open for this folder. Start one with `claude-telegram code` there.";
-export const RECONNECTING_TEXT = "This session is reconnecting to the claude-telegram daemon. Send that again in a few seconds.";
+export const NO_SESSION_TEXT = "No Claude Code session is open for this folder. Start one with `teledesk code` there.";
+export const RECONNECTING_TEXT = "This session is reconnecting to the teledesk daemon. Send that again in a few seconds.";
 export const NO_GROUP_REASON = "No desk group is set up. In Telegram: create a group, turn on Topics, add the bot as an admin with Manage topics, then send /desk_here in the group.";
-export const GENERAL_HINT = "A session's topic opens when /desk turns its desk on (sessions started via `claude-telegram code` or the shell hook). Write in a session's topic to talk to it.";
+export const GENERAL_HINT = "A session's topic opens when /desk turns its desk on (sessions started via `teledesk code` or the shell hook). Write in a session's topic to talk to it.";
 export const FORWARD_TEXT = "Forwarded messages aren't passed to the session. Paste the text if you want it acted on.";
 export const TEXT_ONLY = "Only text messages reach the session for now.";
 export const EARLIER_SESSION = "This prompt belongs to an earlier session.";
@@ -725,7 +725,7 @@ export class DeskRouter {
     }
     this.state.setGroup(chatId);
     this.log(`desk: group ${chatId} is now the desk group`);
-    await this.post(chatId, threadId, "✅ This is the desk group now. In any Claude session started through claude-telegram, /desk opens its topic here.");
+    await this.post(chatId, threadId, "✅ This is the desk group now. In any Claude session started through teledesk, /desk opens its topic here.");
     // Every live session: a new topic if it was elsewhere, otherwise a fresh welcome, which also
     // clears an error a session got while desk was off.
     for (const c of this.conns) if (c.hello && !c.ended) void this.lock(c.hello.cwd, () => this.attach(c));

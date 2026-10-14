@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# claude-telegram code [claude args…] | desk-channel. Works from anywhere once bin/ is on PATH (or symlinked).
+# teledesk code [claude args…] | install | desk-channel. Works from anywhere once bin/ is on PATH (or symlinked).
 DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)" || exit 1
 export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--no-warnings=ExperimentalWarning"
 # No shared transpile cache in /tmp: on a multi-user machine another user could plant code there.

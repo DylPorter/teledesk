@@ -20,7 +20,7 @@ import { BotApi } from "../src/desk/bot-api.js";
 import type { DeskButton, DeskTelegram, DeskUpdate } from "../src/desk/types.js";
 import { DeskDaemon, helpText } from "../src/daemon.js";
 import { classify, Poller, TokenRejected, type RawUpdate } from "../src/poll.js";
-import { deskPaths, ensureDataDir, REPO_ROOT } from "../src/paths.js";
+import { deskPaths, ensureDataDir, migrateLegacyDataDir, REPO_ROOT } from "../src/paths.js";
 
 const tmp = () => mkdtempSync(join(tmpdir(), "ct-test-"));
 const OWNER = 42;
@@ -861,11 +861,11 @@ describe("desk channel server", () => {
     expect(t.tg.inTopic(topic).at(-1)).toBe("⏹ Session ended");
   });
 
-  it("refuses to run without CLAUDE_TELEGRAM_DESK=1", async () => {
+  it("refuses to run without TELEDESK=1", async () => {
     const err = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     try {
       expect(await runDeskChannel("/nonexistent/desk.sock", {})).toBe(1);
-      expect(await runDeskChannel("/nonexistent/desk.sock", { CLAUDE_TELEGRAM_DESK: "true" })).toBe(1);
+      expect(await runDeskChannel("/nonexistent/desk.sock", { TELEDESK: "true" })).toBe(1);
       expect(err).toHaveBeenCalledWith(REFUSAL);
     } finally { err.mockRestore(); }
   });
@@ -995,12 +995,12 @@ describe("desk install", () => {
   it("the rc block wraps claude, is guarded, idempotent and removable", () => {
     const rc = "# my bashrc\nexport X=1\n";
     const once = installBlock(rc);
-    expect(once).toContain("claude-telegram code");
-    expect(once).toContain("CLAUDE_TELEGRAM_DESK");
+    expect(once).toContain("teledesk code");
+    expect(once).toContain("TELEDESK");
     expect(installBlock(once)).toBe(once);
     const off = uninstallBlock(once);
     expect(off).not.toContain(BLOCK_START);
-    expect(off).not.toContain("claude-telegram");
+    expect(off).not.toContain("teledesk");
     expect(off).toContain("export X=1");
   });
 
@@ -1011,8 +1011,8 @@ describe("desk install", () => {
     expect(readFileSync(join(home, ".bashrc"), "utf8")).toContain(BLOCK_START);
     expect(r.skipped).toContain(join(home, ".zshrc"));
     const cmd = join(home, ".claude", "commands", "desk.md");
-    expect(readFileSync(cmd, "utf8")).toContain("mcp__claude-telegram__desk_on");
-    expect(readFileSync(cmd, "utf8")).toContain("mcp__claude-telegram__desk_off");
+    expect(readFileSync(cmd, "utf8")).toContain("mcp__teledesk__desk_on");
+    expect(readFileSync(cmd, "utf8")).toContain("mcp__teledesk__desk_off");
     const u = uninstall(home);
     expect(readFileSync(join(home, ".bashrc"), "utf8")).not.toContain(BLOCK_START);
     expect(existsSync(cmd)).toBe(false);
@@ -1023,8 +1023,8 @@ describe("desk install", () => {
 describe("desk launcher", () => {
   it("passes both variadic flags in --flag=value form before the user's own arguments", () => {
     expect(claudeArgs("/d/desk-mcp.json", ["--model", "opus", "fix the bug"])).toEqual([
-      "--mcp-config=/d/desk-mcp.json", "--dangerously-load-development-channels=server:claude-telegram",
-      "--allowedTools=mcp__claude-telegram__reply,mcp__claude-telegram__desk_on,mcp__claude-telegram__desk_off",
+      "--mcp-config=/d/desk-mcp.json", "--dangerously-load-development-channels=server:teledesk",
+      "--allowedTools=mcp__teledesk__reply,mcp__teledesk__desk_on,mcp__teledesk__desk_off",
       "--model", "opus", "fix the bug"]);
   });
 
@@ -1036,18 +1036,18 @@ describe("desk launcher", () => {
   });
 
   it("plain claude never gets the guard variable, even when started from inside a desk session", async () => {
-    const probe = ["-e", "process.exit(process.env.CLAUDE_TELEGRAM_DESK === '1' ? 3 : 0)"];
-    const env = { ...process.env, CLAUDE_TELEGRAM_DESK: "1" };
+    const probe = ["-e", "process.exit(process.env.TELEDESK === '1' ? 3 : 0)"];
+    const env = { ...process.env, TELEDESK: "1" };
     expect(await runClaude({ args: probe, desk: false, claude: process.execPath, env })).toBe(0);
-    expect(await runClaude({ args: probe, desk: true, claude: process.execPath, env: { ...process.env, CLAUDE_TELEGRAM_DESK: undefined } })).toBe(3);
+    expect(await runClaude({ args: probe, desk: true, claude: process.execPath, env: { ...process.env, TELEDESK: undefined } })).toBe(3);
   });
 
   it("writes an owner-only MCP config that doesn't set the guard variable itself", () => {
     const f = join(tmp(), "desk-mcp.json");
-    writeDeskConfig(f, "/repo/bin/claude-telegram", ["desk-channel"]);
+    writeDeskConfig(f, "/repo/bin/teledesk", ["desk-channel"]);
     expect(statSync(f).mode & 0o777).toBe(0o600);
-    expect(JSON.parse(readFileSync(f, "utf8"))).toEqual(deskMcpConfig("/repo/bin/claude-telegram", ["desk-channel"]));
-    expect(JSON.stringify(deskMcpConfig("c", []))).not.toContain("CLAUDE_TELEGRAM_DESK");
+    expect(JSON.parse(readFileSync(f, "utf8"))).toEqual(deskMcpConfig("/repo/bin/teledesk", ["desk-channel"]));
+    expect(JSON.stringify(deskMcpConfig("c", []))).not.toContain("TELEDESK");
   });
 });
 
@@ -1371,13 +1371,29 @@ describe("final review: smaller fixes", () => {
   it("a rejected bot token stops polling for good and tells the daemon", async () => {
     const poller = new Poller("T", () => {}, (async () => ({ json: async () => ({ ok: false, error_code: 401, description: "Unauthorized" }), status: 401 })) as unknown as typeof fetch);
     await expect(poller.run(() => {}, new AbortController().signal)).rejects.toBeInstanceOf(TokenRejected);
-    const paths = deskPaths({ CLAUDE_TELEGRAM_DATA_DIR: join(tmp(), "data") });
+    const paths = deskPaths({ TELEDESK_DATA_DIR: join(tmp(), "data") });
     let fatal: Error | undefined;
     const d = new DeskDaemon({ ownerId: String(OWNER), paths, log: () => {}, telegram: new FakeTelegram(), poller: { run: async () => { throw new TokenRejected("telegram rejected the bot token (401)"); } }, onFatal: (e) => { fatal = e; } });
     await d.start();
     cleanups.push(() => d.stop());
     await until(() => fatal !== undefined);
     expect(fatal).toBeInstanceOf(TokenRejected);
+  });
+
+  it("moves the pre-rename data folder once, dropping its stale socket", () => {
+    const home = tmp();
+    const legacy = join(home, "claude-telegram");
+    mkdirSync(legacy, { recursive: true });
+    writeFileSync(join(legacy, "desk.db"), "x");
+    writeFileSync(join(legacy, "desk.sock"), "");
+    const p = deskPaths({ TELEDESK_DATA_DIR: join(home, "teledesk") });
+    expect(migrateLegacyDataDir(p)).toBe(legacy);
+    expect(readFileSync(join(p.dataDir, "desk.db"), "utf8")).toBe("x");
+    expect(existsSync(join(p.dataDir, "desk.sock"))).toBe(false);
+    expect(existsSync(legacy)).toBe(false);
+    expect(migrateLegacyDataDir(p)).toBeUndefined(); // exactly once
+    // A fresh install with no legacy folder: nothing to do.
+    expect(migrateLegacyDataDir(deskPaths({ TELEDESK_DATA_DIR: join(tmp(), "fresh") }))).toBeUndefined();
   });
 
   it("group messages carry their date and member joins", () => {
@@ -1535,7 +1551,7 @@ describe("daemon", () => {
     return { run: async (onUpdate: (u: RawUpdate) => void, signal: AbortSignal) => { push = onUpdate; await new Promise<void>((r) => signal.addEventListener("abort", () => r(), { once: true })); }, push: (u: RawUpdate) => push!(u) };
   }
   async function daemon() {
-    const paths = deskPaths({ CLAUDE_TELEGRAM_DATA_DIR: join(tmp(), "data") });
+    const paths = deskPaths({ TELEDESK_DATA_DIR: join(tmp(), "data") });
     const tg = new FakeTelegram();
     const poller = fakePoller();
     const logs: string[] = [];
@@ -1615,10 +1631,10 @@ describe("daemon", () => {
     expect(helpText(state)).toMatch(/Live sessions \(0\):\nnone/);
   });
 
-  it("the CLI's desk-channel refuses to start outside \`claude-telegram code\`", () => {
-    const env: NodeJS.ProcessEnv = { ...process.env, CLAUDE_TELEGRAM_DATA_DIR: tmp() };
-    delete env.CLAUDE_TELEGRAM_DESK;
-    const r = spawnSync(join(REPO_ROOT, "bin", "claude-telegram"), ["desk-channel"], { env, encoding: "utf8", input: "" });
+  it("the CLI's desk-channel refuses to start outside \`teledesk code\`", () => {
+    const env: NodeJS.ProcessEnv = { ...process.env, TELEDESK_DATA_DIR: tmp() };
+    delete env.TELEDESK;
+    const r = spawnSync(join(REPO_ROOT, "bin", "teledesk"), ["desk-channel"], { env, encoding: "utf8", input: "" });
     expect(r.status).toBe(1);
     expect(r.stderr).toContain(REFUSAL.trim());
   });

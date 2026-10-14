@@ -1,23 +1,23 @@
-/** `claude-telegram install`: make plain `claude` desk-capable in interactive shells, and add
+/** `teledesk install`: make plain `claude` desk-capable in interactive shells, and add
  * the /desk command to Claude Code. Sessions then start with the desk channel loaded but
  * DORMANT — no topic, nothing on Telegram — until /desk turns the desk on for that session.
- * Idempotent; `claude-telegram uninstall` removes exactly what install added. */
+ * Idempotent; `teledesk uninstall` removes exactly what install added. */
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-export const BLOCK_START = "# >>> claude-telegram desk >>>";
-export const BLOCK_END = "# <<< claude-telegram desk <<<";
+export const BLOCK_START = "# >>> teledesk >>>";
+export const BLOCK_END = "# <<< teledesk <<<";
 
 /** The shell wrapper: inside a desk session (the guard the launcher sets) plain claude, so
- * nothing recurses; everywhere else claude with the desk channel loaded. `claude-telegram
+ * nothing recurses; everywhere else claude with the desk channel loaded. `teledesk
  * code` passes non-interactive runs (-p, subcommands, --version…) straight to plain claude. */
 export function shellBlock(): string {
   return [
     BLOCK_START,
     "# Plain `claude` starts desk-capable; /desk inside a session opens its Telegram topic.",
     "claude() {",
-    '  if [ -n "$CLAUDE_TELEGRAM_DESK" ]; then command claude "$@"; else command claude-telegram code "$@"; fi',
+    '  if [ -n "$TELEDESK" ]; then command claude "$@"; else command teledesk code "$@"; fi',
     "}",
     BLOCK_END,
   ].join("\n");
@@ -45,9 +45,9 @@ export function uninstallBlock(rc: string): string {
 /** The /desk slash command (user scope, so it exists in every project). */
 export const DESK_COMMAND = `---
 description: Open this session's Telegram topic ("/desk off" closes it)
-allowed-tools: mcp__claude-telegram__desk_on, mcp__claude-telegram__desk_off
+allowed-tools: mcp__teledesk__desk_on, mcp__teledesk__desk_off
 ---
-If the user's argument is "off", call the mcp__claude-telegram__desk_off tool. Otherwise call the mcp__claude-telegram__desk_on tool. Then tell the user in one short line what happened (the topic name, or why it couldn't open). Do nothing else.
+If the user's argument is "off", call the mcp__teledesk__desk_off tool. Otherwise call the mcp__teledesk__desk_on tool. Then tell the user in one short line what happened (the topic name, or why it couldn't open). Do nothing else.
 `;
 
 export interface InstallReport { changed: string[]; skipped: string[] }
