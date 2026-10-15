@@ -5,6 +5,7 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { installShim, uninstallShim } from "./shim.js";
 
 export const BLOCK_START = "# >>> teledesk >>>";
 export const BLOCK_END = "# <<< teledesk <<<";
@@ -54,9 +55,15 @@ export interface InstallReport { changed: string[]; skipped: string[] }
 
 const RC_FILES = [".bashrc", ".zshrc"];
 
+const merge = (a: InstallReport, b: InstallReport): InstallReport =>
+  ({ changed: [...a.changed, ...b.changed], skipped: [...a.skipped, ...b.skipped] });
+
 /** Install into a home folder (the real one by default). Only rc files that already exist are
- * touched; the command file is (re)written either way. */
-export function install(home = homedir()): InstallReport {
+ * touched; the command file is (re)written either way. `shim: true` (`teledesk install --shim`)
+ * also puts a desk-aware `claude` in ~/bin, which is what reaches shells that never read the rc
+ * file — old tmux panes, `sh -c`, systemd units. Off by default: that is a machine-wide
+ * intercept of the binary's name, not a shell setting. */
+export function install(home = homedir(), opts: { shim?: boolean } = {}): InstallReport {
   const report: InstallReport = { changed: [], skipped: [] };
   for (const name of RC_FILES) {
     const rc = join(home, name);
@@ -70,10 +77,10 @@ export function install(home = homedir()): InstallReport {
   mkdirSync(join(home, ".claude", "commands"), { recursive: true });
   writeFileSync(cmd, DESK_COMMAND);
   report.changed.push(cmd);
-  return report;
+  return opts.shim ? merge(report, installShim(home)) : report;
 }
 
-/** Remove what install added. */
+/** Remove what install added, shim included (a `~/bin/claude` that isn't ours is left alone). */
 export function uninstall(home = homedir()): InstallReport {
   const report: InstallReport = { changed: [], skipped: [] };
   for (const name of RC_FILES) {
@@ -86,5 +93,5 @@ export function uninstall(home = homedir()): InstallReport {
   }
   const cmd = join(home, ".claude", "commands", "desk.md");
   if (existsSync(cmd)) { rmSync(cmd); report.changed.push(cmd); }
-  return report;
+  return merge(report, uninstallShim(home));
 }

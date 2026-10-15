@@ -7,6 +7,7 @@ import { randomBytes } from "node:crypto";
 import { renameSync, writeFileSync } from "node:fs";
 import { constants } from "node:os";
 import { CHANNEL_NAME, ENV_GUARD } from "./channel.js";
+import { ENV_SHIM } from "./shim.js";
 
 /** The MCP config that defines the channel server. No env here: the guard variable comes
  * only from the launcher's own environment, so the file alone doesn't enable the channel. */
@@ -73,6 +74,11 @@ export function claudeVersion(claude = "claude"): string | undefined {
 export function runClaude(o: { args: string[]; desk: boolean; claude?: string; env?: NodeJS.ProcessEnv }): Promise<number> {
   const env: NodeJS.ProcessEnv = { ...(o.env ?? process.env) };
   if (o.desk) env[ENV_GUARD] = "1"; else delete env[ENV_GUARD];
+  // This child must be the real binary. With the PATH shim installed (`teledesk install --shim`),
+  // spawning the bare name `claude` would find the shim again, and the shim would hand back to
+  // `teledesk code` — an infinite loop that this one variable ends. Set on both paths: the plain
+  // one too, because `claude --version` from here must not become another wrapped session.
+  env[ENV_SHIM] = "1";
   const child = spawn(o.claude ?? "claude", o.args, { stdio: "inherit", env });
   // Ctrl-C belongs to Claude Code; termination is passed on.
   const onInt = () => { /* claude handles it */ };
