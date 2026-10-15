@@ -26,25 +26,10 @@ export function claudeArgs(configFile: string, userArgs: string[]): string[] {
   return [`--mcp-config=${configFile}`, `--dangerously-load-development-channels=server:${CHANNEL_NAME}`, `--allowedTools=${DESK_TOOLS}`, ...userArgs];
 }
 
-/** claude's subcommands (claude --help, plus older names): none of them is an interactive session. */
-const SUBCOMMANDS = new Set(["agents", "attach", "auth", "auto-mode", "config", "doctor", "gateway", "help", "import", "install", "kill", "logs", "mcp",
-  "migrate-installer", "plugin", "plugins", "purge", "respawn", "rm", "setup-token", "stop", "ultrareview", "update", "upgrade"]);
-/** Flags that mean no interactive session in this terminal (print mode, its formats, version, help, background). */
-const NOT_INTERACTIVE = new Set(["-p", "--print", "--output-format", "--input-format", "-v", "--version", "-h", "--help", "--bg", "--background"]);
-
-/** Whether these claude arguments start an interactive session, the only kind that gets the desk
- * channel: print mode ignores the channel flag, so the server would start with nothing to talk to. */
-export function interactive(args: string[]): boolean {
-  let first: string | undefined;
-  for (const a of args) {
-    if (a === "--") break;
-    if (NOT_INTERACTIVE.has(a.split("=")[0])) return false;
-    // Combined short flags, e.g. -cp.
-    if (/^-[a-zA-Z]{2,}$/.test(a) && /[pvh]/.test(a.slice(1))) return false;
-    if (!a.startsWith("-") && first === undefined) first = a;
-  }
-  return first === undefined || !SUBCOMMANDS.has(first);
-}
+/** The interactive/print/subcommand classifier now lives in argv.ts, shared with the PATH shim
+ * (which generates its shell test from the same lists). Re-exported so callers and tests that
+ * import it from here keep working. */
+export { interactive } from "./argv.js";
 
 export function writeDeskConfig(file: string, command: string, args: string[]): void {
   // A fresh name, created exclusively: never written through something already there.

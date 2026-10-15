@@ -14,6 +14,7 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { NOT_INTERACTIVE, SUBCOMMANDS } from "./argv.js";
 import type { InstallReport } from "./install.js";
 
 /** Marks this file as ours: install refuses to touch a `claude` without it, uninstall only
@@ -31,6 +32,34 @@ export const ENV_SESSION = "TELEDESK";
 
 export const SHIM_REL = join("bin", "claude");
 
+/** The shell mirror of `interactive()` in argv.ts, generated from the same token lists. POSIX sh
+ * only, and deliberately structured to fail *toward* wrapping: anything it cannot classify it
+ * hands to `teledesk code`, which re-decides in TypeScript. A wrong "no" would deny the desk to an
+ * interactive session; a wrong "yes" only costs a node boot. So the fast path is allowed to be
+ * conservative, and the differential test in tests/shim.test.ts pins where it isn't. */
+export function shellClassifier(): string[] {
+  const words = (xs: readonly string[]) => xs.join(" ");
+  return [
+    "# Generated from src/desk/argv.ts by `teledesk install --shim` — do not edit here.",
+    `NOTINT="${words(NOT_INTERACTIVE)}"`,
+    `SUBS="${words(SUBCOMMANDS)}"`,
+    "interactive() {",
+    "  first=''",
+    '  for a in "$@"; do',
+    '    [ "$a" = "--" ] && return 0',
+    '    tok=${a%%=*}',
+    '    for n in $NOTINT; do [ "$tok" = "$n" ] && return 1; done',
+    '    case $a in',
+    '      -[a-zA-Z][a-zA-Z]*) case $a in *p*|*v*|*h*) return 1 ;; esac ;;',
+    '    esac',
+    '    if [ -z "$first" ]; then case $a in -*) ;; *) first=$a ;; esac; fi',
+    '    if [ -n "$first" ]; then for s in $SUBS; do [ "$first" = "$s" ] && return 1; done; fi',
+    "  done",
+    "  return 0",
+    "}",
+  ];
+}
+
 /** The script. POSIX sh, no bash-isms, no absolute paths baked in (it resolves at run time). */
 export function shimScript(): string {
   const lines = [
@@ -39,6 +68,8 @@ export function shimScript(): string {
     "# Interactive claude gets the desk (its topic opens with /desk); everything else — and",
     "# anything a desk session or this script itself started — goes straight to the real binary.",
     `SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")`,
+    "",
+    ...shellClassifier(),
     "",
     "# The first claude on PATH that is not this script, then the known install locations.",
     "real_claude() {",
@@ -64,6 +95,13 @@ export function shimScript(): string {
     '  c=$(real_claude) || { echo "teledesk shim: no claude to run besides this script." >&2; exit 127; }',
     '  exec "$c" "$@"',
     "fi",
+    "",
+    "# Print mode, --version, a subcommand: there is no session to desk, so run it as asked",
+    "# without booting node to be told the same thing (teledesk#18).",
+    "interactive \"$@\" || {",
+    '  c=$(real_claude) || { echo "teledesk shim: no claude to run besides this script." >&2; exit 127; }',
+    '  exec "$c" "$@"',
+    "}",
     "",
     "# No daemon-side wrapper installed: never block the editor.",
     "command -v teledesk >/dev/null 2>&1 || {",

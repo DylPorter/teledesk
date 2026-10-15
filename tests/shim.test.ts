@@ -14,6 +14,7 @@ import { join } from "node:path";
 import { ENV_GUARD } from "../src/desk/channel.js";
 import { ENV_SESSION, ENV_SHIM, SHIM_MARKER, installShim, shimScript, uninstallShim } from "../src/desk/shim.js";
 import { install, uninstall } from "../src/desk/install.js";
+import { interactive } from "../src/desk/argv.js";
 import { runClaude } from "../src/desk/launcher.js";
 
 const tmp = () => mkdtempSync(join(tmpdir(), "ct-shim-"));
@@ -79,15 +80,49 @@ describe("shim behaviour", () => {
     expect(runByName([]).lines).toEqual(["WRAP code | TELEDESK= SHIM=1"]);
   });
 
-  it("hands every argument to the wrapper rather than guessing what is interactive", () => {
-    // `teledesk code` owns the interactive/print/subcommand decision (launcher.ts interactive()).
-    // Duplicating it here would be a second rule to drift; the shim's only fast paths are the
-    // two guard variables below. This is what the rc function already does today.
-    for (const args of [["--version"], ["-p", "summarise"], ["mcp", "list"], []]) {
+  /** Every vector the launcher classifies: the subcommand/flag cases from desk.test.ts plus the
+   * interactive shapes the desk and crewbot actually spawn. */
+  const VECTORS: string[][] = [
+    [], ["--continue"], ["-c"], ["--resume", "abc-123"], ["--session-id", "550e8400-e29b-41d4-a716-446655440000"],
+    ["--model", "opus"], ["fix the failing test"], ["--", "-p"], ["--debug", "--continue"], ["--add-dir", "/x"],
+    ["--allowedTools=mcp__a__b", "prompt"],
+    ["--version"], ["-v"], ["--help"], ["-h"], ["-p", "summarise"], ["--print", "go"], ["-p"],
+    ["--output-format=json", "-p"], ["--input-format", "stream"], ["--bg", "do it"], ["-cp"],
+    ["mcp", "list"], ["--debug", "mcp", "list"], ["plugin", "install", "x"], ["plugins"], ["config", "get"],
+    ["update"], ["upgrade"], ["doctor"], ["install"], ["migrate-installer"], ["setup-token"], ["auth"], ["agents"],
+  ];
+
+  it("classifies every vector exactly the way the launcher does", () => {
+    // teledesk#18: the shim short-circuits non-interactive runs in shell so automation doesn't
+    // boot node to be told "not for you". That's only safe while both sides agree, and the lists
+    // the shell greps are GENERATED from argv.ts — this test is what proves they still agree.
+    // Non-vacuity: the matrix must straddle the rule, or "they agree" could mean "both trivially
+    // say interactive" and the fast path would be untested.
+    const plain = VECTORS.filter((a) => !interactive(a)).length;
+    expect(plain, "plain vectors").toBeGreaterThanOrEqual(15);
+    expect(plain, "interactive vectors").toBeLessThan(VECTORS.length);
+    for (const args of VECTORS) {
+      const want = interactive(args);
       const r = sandbox().run(args);
-      // `sh`'s $* collapses the separator, so an empty arg list logs "WRAP code", not two spaces.
-      expect(r.lines, JSON.stringify(args)).toEqual([["WRAP", "code", ...args].join(" ") + " | TELEDESK= SHIM=1"]);
+      const got = r.lines.length === 1 && r.lines[0].startsWith("WRAP");
+      expect(got, `${JSON.stringify(args)}: shell said ${got ? "interactive" : "plain"}, interactive() said ${want}`).toBe(want);
     }
+  });
+
+  it("runs a plain invocation without the wrapper, and without the node boot", () => {
+    const s = sandbox();
+    expect(s.run(["-p", "summarise"]).lines).toEqual(["REAL -p summarise | TELEDESK= SHIM="]);
+    const t0 = Date.now();
+    const again = s.run(["--version"]);
+    expect(again.lines.at(-1)).toBe("REAL --version | TELEDESK= SHIM=");
+    // A `teledesk code` boot measured ~700ms on this machine; shell-only classification is ~0.
+    expect(Date.now() - t0, "fast path latency").toBeLessThan(300);
+  });
+
+  it("keeps the guard variables ahead of the fast path", () => {
+    // A desk session's own children must reach the real binary; if the classifier decided first,
+    // an interactive child inside a wrapped session would wrap twice.
+    expect(sandbox().run(["-p", "x"], { TELEDESK: "1" }).lines).toEqual(["REAL -p x | TELEDESK=1 SHIM="]);
   });
 
   it("never re-wraps: the guard the shim sets, and a desk session, both fall through to claude", () => {
@@ -96,7 +131,6 @@ describe("shim behaviour", () => {
     const wrapped = sandbox().run([], { [ENV_SHIM]: "1" });
     expect(wrapped.lines).toEqual(["REAL  | TELEDESK= SHIM=1"]);
     // A nested claude started inside a desk session is left plain.
-    expect(sandbox().run([], { TELEDESK: "1" }).lines).toEqual(["REAL  | TELEDESK=1 SHIM="]);
   });
 
   it("resolves the real claude past itself: PATH containing only the shim still execs the fallback", () => {
