@@ -1,7 +1,10 @@
-/** bin/teledesk: `code [claude args…]` starts Claude Code desk-capable (its topic opens
- * with /desk); `install` makes plain `claude` desk-capable and adds the /desk command;
- * `desk-channel` is the channel server Claude Code runs for it (never by hand). Each
- * subcommand loads only what it needs. */
+/** bin/teledesk is the entry point for the desk, and dispatches four subcommands. The code
+ * command starts Claude Code desk-capable, so its topic can be opened with /desk. The install
+ * command makes an ordinary claude invocation desk-capable and adds the /desk slash command;
+ * with the --shim flag it also drops a desk-aware claude in ~/bin, which is the part that
+ * reaches shells that never read the rc file. The desk-channel command is the channel server
+ * Claude Code itself runs for a wrapped session, and is never run by hand. The daemon is a
+ * separate entry point (src/daemon.ts). Each branch imports only what it needs. */
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { deskPaths, ensureDataDir, migrateLegacyDataDir, REPO_ROOT } from "./paths.js";
@@ -10,6 +13,8 @@ const USAGE = `teledesk — your Claude Code sessions in Telegram topics
 
   teledesk code [claude args…]   start Claude Code desk-capable (its topic opens with /desk)
   teledesk install               make plain \`claude\` desk-capable + add the /desk command
+  teledesk install --shim        also put a desk-aware \`claude\` in ~/bin, which reaches shells
+                                 that never read the rc file (old tmux panes, sh -c, systemd)
   teledesk uninstall             remove what install added
   teledesk desk-channel          the channel server Claude Code runs for \`code\` (not run by hand)
 
@@ -34,10 +39,19 @@ async function main(): Promise<void> {
   if (cmd === "code") { process.exitCode = await code(args); return; }
   if (cmd === "install" || cmd === "uninstall") {
     const { install, uninstall } = await import("./desk/install.js");
-    const r = cmd === "install" ? install() : uninstall();
+    const { shimPath } = await import("./desk/shim.js");
+    const shim = cmd === "install" && args.includes("--shim");
+    const r = cmd === "install" ? install(undefined, { shim }) : uninstall();
     for (const f of r.changed) console.log(`${cmd === "install" ? "updated" : "cleaned"}: ${f}`);
     for (const f of r.skipped) console.log(`skipped: ${f}`);
-    if (cmd === "install") console.log("Open a new terminal (or `source ~/.bashrc`), start claude as usual, then /desk inside a session opens its Telegram topic.");
+    // A ~/bin/claude that isn't ours is the one failure that would otherwise read as success.
+    if (cmd === "install" && shim && r.skipped.includes(shimPath())) {
+      console.log(`not touched: ${shimPath()} already exists and isn't a teledesk shim — move it, or install without --shim.`);
+      process.exitCode = 1;
+    }
+    if (cmd === "install") console.log(shim
+      ? "Done: \`claude\` is desk-capable from now on, including in shells and panes opened before this. /desk inside a session opens its Telegram topic."
+      : "Open a new terminal (or `source ~/.bashrc`), start claude as usual, then /desk inside a session opens its Telegram topic.");
     return;
   }
   if (cmd === "desk-channel") {
