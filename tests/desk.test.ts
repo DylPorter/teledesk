@@ -137,6 +137,8 @@ describe("desk protocol", () => {
     expect(ok({ type: "reply", text: "hi" })).toBe(true);
     expect(ok({ type: "permission_request", request_id: "abcde", tool_name: "Bash", description: "d", input_preview: "{}" })).toBe(true);
     expect(ok({ type: "bye" })).toBe(true);
+    expect(ok({ type: "bye", hide: true })).toBe(true);
+    expect(ok({ type: "bye", hide: "yes" })).toBe(false);
     expect(ok({ type: "permission_request", request_id: "abcdl", tool_name: "Bash", description: "d", input_preview: "" })).toBe(false); // no 'l'
     expect(ok({ type: "permission_request", request_id: "ABCDE", tool_name: "Bash", description: "d", input_preview: "" })).toBe(false);
     expect(ok({ type: "reply", text: "x".repeat(MAX_TEXT_BYTES + 1) })).toBe(false);
@@ -212,6 +214,21 @@ describe("desk router: topics and routing", () => {
     expect(tg.reopened).toEqual([s.topic]);
     expect(tg.topics).toHaveLength(1);
     expect(tg.inTopic(s.topic).at(-1)).toMatch(/Session started/);
+  });
+
+  it("a bye flagged hide (/desk off) quietly takes the topic out of the list; the next /desk brings it back", async () => {
+    const { tg, state, open } = await setup();
+    const s = await open("/w/proj", 11);
+    s.c.send({ type: "bye", hide: true });
+    await until(() => state.get(s.sid)!.status === "offline");
+    expect(tg.closed).toEqual([s.topic]); // hidden, not deleted, no words
+    expect(state.get(s.sid)!.topic_id).toBe(s.topic);
+    expect(state.get(s.sid)!.topic_closed).toBe(1); // the sweep won't re-close it
+    expect(tg.inTopic(s.topic).some((t) => /Session ended|⏹|hidden|closed/i.test(t))).toBe(false);
+    const again = await open("/w/proj", 12);
+    expect(again.topic).toBe(s.topic);
+    expect(tg.reopened).toEqual([s.topic]);
+    expect(state.get(s.sid)!.topic_closed).toBe(0);
   });
 
   it("a channel that just disconnects is marked offline the same way — the topic stays as it was", async () => {
@@ -922,11 +939,12 @@ describe("desk channel: dormant until /desk", () => {
       params: { request_id: "qwert", tool_name: "Bash", description: "List files", input_preview: "{\"command\":\"ls\"}" },
     });
     await until(() => t.tg.sent.some((m) => m.buttons));
-    // off: relaying stops, row offline — the topic itself stays exactly as it was
+    // off: relaying stops, row offline, topic quietly hidden from the list
     const off = await call("desk_off");
     expect(off.content[0].text).toMatch(/off/i);
-    await until(() => t.state.findLive("/w/d", 92) === undefined);
-    expect(t.tg.closed).toEqual([]);
+    await until(() => t.tg.closed.includes(topic));
+    expect(t.state.findLive("/w/d", 92)).toBeUndefined();
+    expect(t.tg.inTopic(topic).some((x) => /Session ended|⏹/i.test(x))).toBe(false); // hidden without a word
     // on again: the same topic, reopened
     const on2 = await call("desk_on");
     expect(on2.isError).toBeFalsy();

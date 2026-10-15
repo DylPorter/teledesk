@@ -23,7 +23,9 @@ export const ChannelMessage = z.discriminatedUnion("type", [
   z.object({ type: z.literal("reply"), text: text().refine((s) => s.trim().length > 0, "empty") }).strict(),
   // too_long: the request was too big to send whole; it's shown as answer-in-the-terminal only.
   z.object({ type: z.literal("permission_request"), request_id: requestId, tool_name: z.string().min(1).max(256), description: text(), input_preview: text(), too_long: z.literal(true).optional() }).strict(),
-  z.object({ type: z.literal("bye") }).strict(),
+  // hide: set only by an explicit /desk off — "take this topic off my list for now" (quietly,
+  // and /desk reopens the same one). A plain bye is the session dying, and its topic stays open.
+  z.object({ type: z.literal("bye"), hide: z.literal(true).optional() }).strict(),
 ]);
 export type ChannelMessage = z.infer<typeof ChannelMessage>;
 

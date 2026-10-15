@@ -22,7 +22,7 @@ export const ENV_GUARD = "TELEDESK";
 export const REFUSAL = `teledesk desk-channel: not starting, because ${ENV_GUARD}=1 isn't set. This server only runs inside a session started with \`teledesk code\`, which sets it.\n`;
 
 export const INSTRUCTIONS = [
-  "The owner can talk to this session from Telegram while its desk topic is on. They turn it on with /desk (which calls the desk_on tool) and off with /desk off (desk_off). While it's off, reply is unavailable and permission prompts go to the terminal only.",
+  "The owner can talk to this session from Telegram while its desk topic is on. They turn it on with /desk (which calls the desk_on tool) and off with /desk off (desk_off), which quietly hides the topic until /desk again. While it's off, reply is unavailable and permission prompts go to the terminal only.",
   `While the topic is on, their messages arrive as <channel source="${CHANNEL_NAME}" message_id="...">text</channel>; teledesk only passes on text the owner wrote themselves, from their own Telegram account (forwarded messages are never passed on).`,
   "They read Telegram, not this terminal: anything you want them to see must go through the reply tool. Your normal transcript output never reaches them.",
   "The topic is this session's own, so reply takes just the text. Use plain text (no Markdown rendering); long replies are split automatically.",
@@ -127,8 +127,10 @@ export class DaemonLink {
   }
 
   /** Say bye (if connected) and stop reconnecting; `start()` can bring the link back later
-   * (desk_off then desk_on), and `close()` at process exit is the same thing permanently. */
-  async detach(): Promise<void> {
+   * (desk_off then desk_on), and `close()` at process exit is the same thing permanently.
+   * `hide: true` marks the bye as an explicit /desk off: the daemon quietly takes the topic
+   * out of the list until /desk reopens it. A plain bye leaves the topic exactly as it is. */
+  async detach(hide?: boolean): Promise<void> {
     this.closing = true;
     clearTimeout(this.timer);
     const sock = this.sock;
@@ -137,14 +139,14 @@ export class DaemonLink {
     await new Promise<void>((r) => {
       const t = setTimeout(() => { sock.destroy(); r(); }, 1000);
       sock.once("close", () => { clearTimeout(t); r(); });
-      sock.end(encode({ type: "bye" }));
+      sock.end(encode({ type: "bye", ...(hide ? { hide: true } : {}) }));
     });
     this.connected = false;
     this.welcomed = false;
   }
 
-  /** Say bye (if connected) and stop reconnecting. */
-  async close(): Promise<void> { await this.detach(); }
+  /** Say bye (if connected) and stop reconnecting; `hide` is for /desk off only. */
+  async close(hide?: boolean): Promise<void> { await this.detach(hide); }
 }
 
 const PermissionRequest = z.object({
@@ -152,7 +154,7 @@ const PermissionRequest = z.object({
   params: z.object({ request_id: z.string(), tool_name: z.string(), description: z.string(), input_preview: z.string() }).passthrough(),
 });
 
-export interface DeskChannel { server: Server; link: DaemonLink; close(): Promise<void> }
+export interface DeskChannel { server: Server; link: DaemonLink; close(hide?: boolean): Promise<void> }
 
 /** What desk_on resolves to: the topic, the daemon's reason there isn't one, or no daemon. */
 type Activation = { kind: "welcome"; topic: string } | { kind: "error"; reason: string } | { kind: "unreachable" };
@@ -218,7 +220,7 @@ export async function startDeskChannel(o: { socketPath: string; hello: Hello; tr
       },
       {
         name: "desk_off",
-        description: "Stop relaying to this session's Telegram topic. This is what the owner's /desk off runs; the topic itself stays put and /desk picks it right back up.",
+        description: "Stop relaying to this session's Telegram topic and quietly hide the topic from the list. This is what the owner's /desk off runs; /desk reopens the very same topic.",
         inputSchema: { type: "object", properties: {} },
       },
     ],
@@ -238,8 +240,8 @@ export async function startDeskChannel(o: { socketPath: string; hello: Hello; tr
       if (!activated) return ok("Desk is already off.");
       activated = false;
       topicName = undefined;
-      await link.detach();
-      return ok("Desk is off: relaying stopped and permission prompts are terminal-only again. The topic itself stays as it is; /desk turns the desk back on in it.");
+      await link.detach(true);
+      return ok("Desk is off: relaying stopped and permission prompts are terminal-only again. The topic is quietly hidden from the list; /desk brings the same one back.");
     }
     if (req.params.name !== "reply") return fail(`unknown tool: ${req.params.name}`);
     const text = (req.params.arguments as { text?: unknown } | undefined)?.text;
@@ -269,7 +271,7 @@ export async function startDeskChannel(o: { socketPath: string; hello: Hello; tr
 
   await server.connect(o.transport);
   if (activated) link.start();
-  return { server, link, close: async () => { await link.close(); await server.close().catch(() => undefined); } };
+  return { server, link, close: async (hide?: boolean) => { await link.close(hide); await server.close().catch(() => undefined); } };
 }
 
 /** The git branch of a folder, if it's in a repo. */
@@ -292,7 +294,7 @@ export async function runDeskChannel(socketPath: string, env: NodeJS.ProcessEnv 
   const cwd = resolve(env.CLAUDE_PROJECT_DIR || process.cwd());
   const hello: Hello = { type: "hello", cwd, pid: process.pid, title: (basename(cwd) || cwd).slice(0, 256), branch: gitBranch(cwd) };
   const ch = await startDeskChannel({ socketPath, hello, transport: new StdioServerTransport(), log });
-  // When Claude Code exits, stdin closes: say bye so the topic closes, then exit.
+  // When Claude Code exits, stdin closes: say a plain bye (the topic stays as it is), then exit.
   let done = false;
   const shutdown = () => {
     if (done) return;

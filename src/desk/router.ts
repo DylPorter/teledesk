@@ -373,7 +373,7 @@ export class DeskRouter {
       return;
     }
     if (m.type === "bye") {
-      if (conn.hello) await this.lock(conn.hello.cwd, () => this.endSession(conn));
+      if (conn.hello) await this.lock(conn.hello.cwd, () => this.endSession(conn, m.hide === true));
       conn.sock.end();
       return;
     }
@@ -495,17 +495,29 @@ export class DeskRouter {
     if (t) { clearTimeout(t); this.graceTimers.delete(id); }
   }
 
-  /** The session let go (bye, crash, dropped socket): mark it offline and say nothing. The topic
-   * stays open and untouched — it disappears from the list only when the inactivity sweep closes
-   * it, and the next /desk in this folder brings the same topic back. Open prompts keep their
-   * buttons: a tap on one gets a toast saying the session isn't connected. */
-  private async endSession(conn: Conn): Promise<void> {
+  /** The session let go (bye, crash, dropped socket): mark it offline and say nothing. Open
+   * prompts keep their buttons — a tap gets a toast saying the session isn't connected. The
+   * topic itself only leaves the list two ways: this bye was an explicit /desk off (`hide`,
+   * quietly closed below), or the inactivity sweep after the TTL. Either way the next /desk in
+   * this folder brings the very same topic back. */
+  private async endSession(conn: Conn, hide = false): Promise<void> {
     if (conn.ended) return;
     conn.ended = true;
     const id = conn.sessionId;
     if (id === undefined) return;
     if (this.bySession.get(id) === conn) this.bySession.delete(id);
+    if (hide) await this.hideRowTopic(id, conn.hello?.pid);
     await this.setRowOffline(id, conn.hello?.pid);
+  }
+
+  /** /desk off only: close the row's topic without a word (already-closed counts as done) and
+   * flag it, so the sweep won't re-close it while it waits to be reopened by the next /desk. */
+  private async hideRowTopic(id: number, pid?: number | null): Promise<void> {
+    const row = this.state.get(id);
+    if (!row || row.status !== "live" || (pid != null && row.pid !== pid)) return;
+    if (!row.group_id || row.topic_id === null) return;
+    await this.tg.closeTopic(row.group_id, row.topic_id).catch((e) => { if (!notModified(e)) this.log(`desk: couldn't hide topic ${row.topic_id}: ${errText(e)}`); });
+    this.state.markClosed(row.id);
   }
 
   /** Mark a row offline (only if it's still the same live session). */
