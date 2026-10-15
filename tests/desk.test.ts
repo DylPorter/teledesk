@@ -10,7 +10,7 @@ import { z } from "zod";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ChannelMessage, clip, DaemonMessage, decode, elideMiddle, LineReader, MAX_TEXT_BYTES } from "../src/desk/protocol.js";
-import { BEFORE_SESSION, DEFAULT_LIMITS, DeskRouter, REPLY_MARK, type DeskLimits, EARLIER_SESSION, FORWARD_TEXT, GENERAL_HINT, NO_GROUP_REASON, NO_PROMPT, NO_SESSION_TEXT, PRIVACY_OFF, promptMessages, TEXT_ONLY, tooLongText, topicName } from "../src/desk/router.js";
+import { BEFORE_SESSION, DEFAULT_LIMITS, DeskRouter, REPLY_MARK, type DeskLimits, EARLIER_SESSION, FORWARD_TEXT, GENERAL_HINT, NO_GROUP_REASON, NO_PROMPT, NOT_CONNECTED, NO_SESSION_TEXT, PRIVACY_OFF, promptMessages, TEXT_ONLY, tooLongText, topicName } from "../src/desk/router.js";
 import { SqliteDeskState, sqliteMeta } from "../src/desk/state.js";
 import { REFUSAL, runDeskChannel, startDeskChannel, type DeskChannel } from "../src/desk/channel.js";
 import { claudeArgs, deskMcpConfig, interactive, olderThan, runClaude, writeDeskConfig } from "../src/desk/launcher.js";
@@ -45,7 +45,6 @@ class FakeTelegram implements DeskTelegram {
   edits: { chat: string; id: number; text: string }[] = [];
   closed: number[] = [];
   reopened: number[] = [];
-  deleted: { chat: string; id: number }[] = [];
   renamed: { id: number; name: string }[] = [];
   answers: { id: string; text?: string }[] = [];
   typingIn: number[] = [];
@@ -61,7 +60,6 @@ class FakeTelegram implements DeskTelegram {
   async editTopic(_c: string, id: number, name: string) { this.renamed.push({ id, name }); }
   async closeTopic(_c: string, id: number) { this.closed.push(id); }
   async reopenTopic(_c: string, id: number) { this.reopened.push(id); }
-  async deleteTopic(chat: string, id: number) { this.deleted.push({ chat, id }); }
   async send(chat: string, thread: number | undefined, text: string, buttons?: DeskButton[][]) {
     if (this.failSend?.(text)) throw new Error("telegram sendMessage: Bad Request: boom");
     const id = this.nextMsg++;
@@ -201,13 +199,13 @@ describe("desk router: topics and routing", () => {
     expect(tg.topics.map((t) => t.name)).toEqual(["proj · main", "proj · main #2"]);
   });
 
-  it("a session that says bye: Session ended, topic closed; the same folder later reopens the same topic", async () => {
+  it("a session that says bye leaves its topic open and unsaid-to; the same folder gets that very topic back", async () => {
     const { tg, state, open } = await setup();
     const s = await open("/w/proj", 11, "main");
     s.c.send({ type: "bye" });
-    await until(() => tg.closed.includes(s.topic));
-    expect(tg.inTopic(s.topic).at(-1)).toBe("⏹ Session ended");
-    expect(state.get(s.sid)!.status).toBe("offline");
+    await until(() => state.get(s.sid)!.status === "offline");
+    expect(tg.closed).toEqual([]);
+    expect(tg.inTopic(s.topic)).toEqual([expect.stringMatching(/^▶️ Session started/)]);
     const again = await open("/w/proj", 13, "main");
     expect(again.topic).toBe(s.topic);
     expect(again.sid).toBe(s.sid);
@@ -216,20 +214,20 @@ describe("desk router: topics and routing", () => {
     expect(tg.inTopic(s.topic).at(-1)).toMatch(/Session started/);
   });
 
-  it("a channel that just disconnects ends its session the same way", async () => {
+  it("a channel that just disconnects is marked offline the same way — the topic stays as it was", async () => {
     const { tg, state, open } = await setup();
     const s = await open("/w/proj", 11);
     s.c.sock.destroy();
-    await until(() => tg.closed.includes(s.topic));
-    expect(tg.inTopic(s.topic).at(-1)).toBe("⏹ Session ended");
-    expect(state.get(s.sid)!.status).toBe("offline");
+    await until(() => state.get(s.sid)!.status === "offline");
+    expect(tg.closed).toEqual([]);
+    expect(tg.inTopic(s.topic)).toEqual([expect.stringMatching(/^▶️ Session started/)]);
   });
 
   it("text in a topic with no live session gets told how to start one", async () => {
-    const { tg, router, open } = await setup();
+    const { tg, state, router, open } = await setup();
     const s = await open("/w/proj", 11);
     s.c.send({ type: "bye" });
-    await until(() => tg.closed.includes(s.topic));
+    await until(() => state.get(s.sid)!.status === "offline");
     await router.onUpdate(say("are you there?", s.topic));
     expect(tg.inTopic(s.topic).at(-1)).toBe(NO_SESSION_TEXT);
     await router.onUpdate(say("hello?", 4242)); // a topic the router didn't make
@@ -575,7 +573,7 @@ describe("desk router: permission prompts", () => {
     await until(() => t.tg.sent.some((m) => m.buttons));
     const old = t.tg.sent.find((m) => m.buttons)!;
     first.c.send({ type: "bye" });
-    await until(() => t.tg.closed.includes(first.topic));
+    await until(() => t.state.get(first.sid)!.status === "offline");
     const second = await t.open("/w/proj", 12); // reuses the row
     expect(second.sid).toBe(first.sid);
     await t.router.onUpdate(tap(old.buttons![0][0].data, old.id, old.text));
@@ -594,13 +592,15 @@ describe("desk router: permission prompts", () => {
     expect(t.tg.edits[0].id).toBe(t.tg.sent.find((m) => m.buttons)!.id);
   });
 
-  it("a tap after the session ended says so and sends nothing", async () => {
-    const { tg, router, s, prompt } = await prompted();
+  it("a tap after the session is gone is answered with a toast; the prompt keeps its buttons and nothing is written to the topic", async () => {
+    const { tg, state, router, s, prompt } = await prompted();
     s.c.send({ type: "bye" });
-    await until(() => tg.closed.includes(s.topic));
-    expect(tg.edits.at(-1)!.text).toMatch(/Session ended before an answer/); // open prompt loses its buttons
+    await until(() => state.get(s.sid)!.status === "offline");
     await router.onUpdate(tap(prompt.buttons![0][0].data, prompt.id, prompt.text));
-    expect(tg.answers.at(-1)!.text).toBe("This session has ended.");
+    expect(tg.answers.at(-1)!.text).toBe(NOT_CONNECTED);
+    await settle();
+    expect(tg.edits).toEqual([]); // the prompt isn't rewritten out from under the owner
+    expect(tg.inTopic(s.topic).some((t) => /Session ended|⏹/.test(t))).toBe(false); // no exit announcement
   });
 });
 
@@ -652,7 +652,7 @@ describe("desk router: daemon restarts", () => {
     expect((await back.c.wait("message")).text).toBe("after restart");
   });
 
-  it("a session that ended while the daemon was down is closed when it starts", async () => {
+  it("a session that ended while the daemon was down is marked offline when it starts; its topic is left alone", async () => {
     const dir = tmp();
     const { state } = memState();
     state.setGroup(G);
@@ -662,11 +662,11 @@ describe("desk router: daemon restarts", () => {
     await first.stop();
     await setup({ dir, state, tg, alive: () => false });
     await until(() => state.get(s.sid)!.status === "offline");
-    expect(tg.closed).toContain(s.topic);
-    expect(tg.inTopic(s.topic).at(-1)).toBe("⏹ Session ended");
+    expect(tg.closed).toEqual([]);
+    expect(tg.inTopic(s.topic).some((t) => /Session ended|⏹/.test(t))).toBe(false);
   });
 
-  it("a live session that never reconnects is ended after the grace period", async () => {
+  it("a live session that never reconnects is marked offline after the grace period, silently", async () => {
     const dir = tmp();
     const { state } = memState();
     state.setGroup(G);
@@ -675,8 +675,8 @@ describe("desk router: daemon restarts", () => {
     const s = await first.open("/w/proj", 11);
     await first.stop();
     await setup({ dir, state, tg, graceMs: 20 });
-    await until(() => tg.closed.includes(s.topic));
-    expect(state.get(s.sid)!.status).toBe("offline");
+    await until(() => state.get(s.sid)!.status === "offline");
+    expect(tg.closed).toEqual([]);
   });
 });
 
@@ -853,12 +853,13 @@ describe("desk channel server", () => {
     expect(r.content[0].text).toMatch(/desk_here/);
   });
 
-  it("closing says bye: the topic gets Session ended", async () => {
+  it("closing says bye: the topic stays open and nothing is announced", async () => {
     const t = await setup();
     const { ch, topic } = await channel(t);
     await ch.close();
-    await until(() => t.tg.closed.includes(topic));
-    expect(t.tg.inTopic(topic).at(-1)).toBe("⏹ Session ended");
+    await until(() => t.state.findLive("/w/proj", 77) === undefined);
+    expect(t.tg.closed).toEqual([]);
+    expect(t.tg.inTopic(topic).some((x) => /Session ended|⏹/.test(x))).toBe(false);
   });
 
   it("refuses to run without TELEDESK=1", async () => {
@@ -921,12 +922,12 @@ describe("desk channel: dormant until /desk", () => {
       params: { request_id: "qwert", tool_name: "Bash", description: "List files", input_preview: "{\"command\":\"ls\"}" },
     });
     await until(() => t.tg.sent.some((m) => m.buttons));
-    // off: topic closed, row offline
+    // off: relaying stops, row offline — the topic itself stays exactly as it was
     const off = await call("desk_off");
     expect(off.content[0].text).toMatch(/off/i);
-    await until(() => t.tg.closed.includes(topic));
-    expect(t.state.findLive("/w/d", 92)).toBeUndefined();
-    // on again: same topic reopened
+    await until(() => t.state.findLive("/w/d", 92) === undefined);
+    expect(t.tg.closed).toEqual([]);
+    // on again: the same topic, reopened
     const on2 = await call("desk_on");
     expect(on2.isError).toBeFalsy();
     await until(() => t.tg.reopened.includes(topic));
@@ -950,21 +951,38 @@ describe("desk topic sweep", () => {
     return row;
   };
 
-  it("deletes ended sessions' topics after the TTL, keeps fresh and live ones", async () => {
+  it("closes gone sessions' topics after the TTL — never deletes — and keeps fresh and live ones", async () => {
     const tg = new FakeTelegram();
     const { state, db } = memState();
     state.setGroup(G);
     const t = await setup({ tg, state });
-    seed(state, db, "/w/old", 1, 201, 8);
+    const old = seed(state, db, "/w/old", 1, 201, 8);
     seed(state, db, "/w/fresh", 2, 202, 1);
     const live = state.claim("/w/live", 3, "live", undefined);
     state.setTopic(live.id, G, 203, "live");
     db.prepare("UPDATE desk_sessions SET updated_at = datetime('now', '-30 days') WHERE id = ?").run(live.id);
     expect(await t.router.sweepStaleTopics()).toBe(1);
-    expect(tg.deleted).toEqual([{ chat: G, id: 201 }]);
-    const oldRow = state.stale("9999-01-01 00:00:00");
-    expect(oldRow.map((r) => r.cwd)).toEqual(["/w/fresh"]); // the swept row lost its topic
-    expect(state.get(live.id)!.topic_id).toBe(203);
+    expect(tg.closed).toEqual([201]);
+    // the closed topic keeps its id so the next /desk can reopen it; the flag keeps the sweep off it
+    expect(state.get(old.id)!.topic_id).toBe(201);
+    expect(state.get(old.id)!.topic_closed).toBe(1);
+    expect(state.stale("9999-01-01 00:00:00").map((r) => r.cwd)).toEqual(["/w/fresh"]); // the closed one is out of sweep range
+    expect(state.get(live.id)!.topic_id).toBe(203); // live sessions keep their topics no matter the age
+    expect(await t.router.sweepStaleTopics()).toBe(0); // nothing is closed twice
+  });
+
+  it("a topic the sweep closed comes back for the next session of that folder", async () => {
+    const tg = new FakeTelegram();
+    const { state, db } = memState();
+    state.setGroup(G);
+    const t = await setup({ tg, state });
+    const old = seed(state, db, "/w/old", 1, 201, 8);
+    expect(await t.router.sweepStaleTopics()).toBe(1);
+    const again = await t.open("/w/old", 9); // /desk in that folder
+    expect(again.topic).toBe(201);
+    expect(tg.reopened).toEqual([201]);
+    expect(state.get(old.id)!.topic_closed).toBe(0);
+    expect(state.get(old.id)!.status).toBe("live");
   });
 
   it("the TTL comes from topicTtlDays", async () => {
@@ -976,18 +994,33 @@ describe("desk topic sweep", () => {
     cleanups.push(() => router.stop());
     seed(state, db, "/w/x", 1, 301, 2);
     expect(await router.sweepStaleTopics()).toBe(1);
-    expect(tg.deleted).toEqual([{ chat: G, id: 301 }]);
+    expect(tg.closed).toEqual([301]);
   });
 
-  it("a topic whose deletion fails stays for the next sweep", async () => {
+  it("a topic whose closing fails stays for the next sweep", async () => {
     const tg = new FakeTelegram();
-    tg.deleteTopic = async () => { throw new Error("telegram deleteForumTopic: boom"); };
+    tg.closeTopic = async () => { throw new Error("telegram closeForumTopic: boom"); };
     const { state, db } = memState();
     state.setGroup(G);
     const t = await setup({ tg, state });
     const row = seed(state, db, "/w/stuck", 1, 401, 30);
     expect(await t.router.sweepStaleTopics()).toBe(0);
     expect(state.get(row.id)!.topic_id).toBe(401);
+    expect(state.get(row.id)!.topic_closed).toBe(0);
+    tg.closeTopic = async (c, id) => { tg.closed.push(id); }; // Telegram recovers
+    expect(await t.router.sweepStaleTopics()).toBe(1);
+  });
+
+  it("a topic someone else already closed is flagged without fuss", async () => {
+    const tg = new FakeTelegram();
+    tg.closeTopic = async () => { throw new Error("telegram closeForumTopic: Bad Request: TOPIC_NOT_MODIFIED"); };
+    const { state, db } = memState();
+    state.setGroup(G);
+    const t = await setup({ tg, state });
+    const row = seed(state, db, "/w/hand", 1, 501, 30);
+    expect(await t.router.sweepStaleTopics()).toBe(0);
+    expect(state.get(row.id)!.topic_closed).toBe(1); // won't be tried again
+    expect(t.logs.some((l) => l.includes("couldn't close stale topic"))).toBe(false);
   });
 });
 
@@ -1323,9 +1356,9 @@ describe("final review: smaller fixes", () => {
     await t.router.onUpdate(say("hi", undefined));
     await t.router.onUpdate(say("hi", 4242));
     s.c.send({ type: "bye" });
-    await until(() => t.tg.closed.includes(s.topic));
+    await until(() => t.state.get(s.sid)!.status === "offline");
     for (const m of t.tg.sent) expect(m.text.startsWith(REPLY_MARK), m.text).toBe(false);
-    for (const x of [NO_SESSION_TEXT, GENERAL_HINT, FORWARD_TEXT, TEXT_ONLY, EARLIER_SESSION, NO_PROMPT, BEFORE_SESSION, PRIVACY_OFF, tooLongText("Bash")]) expect(x.startsWith(REPLY_MARK)).toBe(false);
+    for (const x of [NO_SESSION_TEXT, GENERAL_HINT, FORWARD_TEXT, TEXT_ONLY, EARLIER_SESSION, NOT_CONNECTED, NO_PROMPT, BEFORE_SESSION, PRIVACY_OFF, tooLongText("Bash")]) expect(x.startsWith(REPLY_MARK)).toBe(false);
   });
 
   it("failed reply parts are reported in the topic", async () => {

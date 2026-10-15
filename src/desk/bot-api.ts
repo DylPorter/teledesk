@@ -32,7 +32,6 @@ export class BotApi implements DeskTelegram {
   async editTopic(chatId: string, threadId: number, name: string): Promise<void> { await this.call("editForumTopic", { chat_id: chatId, message_thread_id: threadId, name }); }
   async closeTopic(chatId: string, threadId: number): Promise<void> { await this.call("closeForumTopic", { chat_id: chatId, message_thread_id: threadId }); }
   async reopenTopic(chatId: string, threadId: number): Promise<void> { await this.call("reopenForumTopic", { chat_id: chatId, message_thread_id: threadId }); }
-  async deleteTopic(chatId: string, threadId: number): Promise<void> { await this.call("deleteForumTopic", { chat_id: chatId, message_thread_id: threadId }); }
   async send(chatId: string, threadId: number | undefined, text: string, buttons?: DeskButton[][]): Promise<number> {
     return (await this.call<{ message_id: number }>("sendMessage", {
       chat_id: chatId, text, link_preview_options: { is_disabled: true },

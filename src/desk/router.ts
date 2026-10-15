@@ -19,6 +19,7 @@ export const GENERAL_HINT = "A session's topic opens when /desk turns its desk o
 export const FORWARD_TEXT = "Forwarded messages aren't passed to the session. Paste the text if you want it acted on.";
 export const TEXT_ONLY = "Only text messages reach the session for now.";
 export const EARLIER_SESSION = "This prompt belongs to an earlier session.";
+export const NOT_CONNECTED = "That session isn't connected any more — answer it in the terminal.";
 export const NO_PROMPT = "No open prompt with that code in this session.";
 export { CHUNK, promptMessages, tooLongText };
 export const BEFORE_SESSION = "That message was sent before this session started, so it wasn't passed on.";
@@ -100,7 +101,7 @@ export interface DeskRouterOptions {
   log: DeskLog;
   /** Whether a process is still running (default: signal 0). */
   alive?: (pid: number) => boolean;
-  /** After a restart, how long a live session has to reconnect before it's ended. */
+  /** After a restart, how long a live session has to reconnect before it's marked offline. */
   graceMs?: number;
   /** How long a new connection has to say hello. */
   helloTimeoutMs?: number;
@@ -272,13 +273,13 @@ export class DeskRouter {
     try { server.listen(path); } finally { if (restore !== undefined) process.umask(restore); }
     await listening;
     chmodSync(path, 0o600);
-    // Only now that this router owns the socket: sessions left live by the last one close if they
-    // ended meanwhile, and running ones get time to reconnect. (Runs before any connection is handled.)
+    // Only now that this router owns the socket: sessions left live by the last one are marked
+    // offline if they ended meanwhile, and running ones get time to reconnect. Topics are untouched.
     for (const row of this.state.live()) {
-      if (!row.pid || !this.alive(row.pid)) void this.lock(row.cwd, () => this.endRow(row.id));
+      if (!row.pid || !this.alive(row.pid)) void this.lock(row.cwd, () => this.setRowOffline(row.id));
       else this.graceTimers.set(row.id, setTimeout(() => {
         this.graceTimers.delete(row.id);
-        if (!this.bySession.has(row.id)) void this.lock(row.cwd, () => this.endRow(row.id, row.pid));
+        if (!this.bySession.has(row.id)) void this.lock(row.cwd, () => this.setRowOffline(row.id, row.pid));
       }, this.opts.graceMs ?? 90_000).unref());
     }
     server.on("error", (e) => this.log(`desk: socket error: ${e.message}`));
@@ -494,30 +495,24 @@ export class DeskRouter {
     if (t) { clearTimeout(t); this.graceTimers.delete(id); }
   }
 
-  /** The session is over: its open prompts lose their buttons, "Session ended", topic closed. */
+  /** The session let go (bye, crash, dropped socket): mark it offline and say nothing. The topic
+   * stays open and untouched — it disappears from the list only when the inactivity sweep closes
+   * it, and the next /desk in this folder brings the same topic back. Open prompts keep their
+   * buttons: a tap on one gets a toast saying the session isn't connected. */
   private async endSession(conn: Conn): Promise<void> {
     if (conn.ended) return;
     conn.ended = true;
     const id = conn.sessionId;
     if (id === undefined) return;
     if (this.bySession.get(id) === conn) this.bySession.delete(id);
-    const row = this.state.get(id);
-    if (row?.group_id) {
-      for (const p of conn.pending.values()) await this.tg.edit(row.group_id, p.messageId, `${p.text}\n\nSession ended before an answer.`).catch(() => undefined);
-    }
-    conn.pending.clear();
-    await this.endRow(id, conn.hello?.pid);
+    await this.setRowOffline(id, conn.hello?.pid);
   }
 
-  /** Close a row's topic and mark it offline (only if it's still the same live session). */
-  private async endRow(id: number, pid?: number | null): Promise<void> {
+  /** Mark a row offline (only if it's still the same live session). */
+  private async setRowOffline(id: number, pid?: number | null): Promise<void> {
     const row = this.state.get(id);
     if (!row || row.status !== "live" || (pid != null && row.pid !== pid)) return;
     if (this.bySession.has(id)) return; // reconnected meanwhile
-    if (row.group_id && row.topic_id !== null) {
-      await this.post(row.group_id, row.topic_id, "⏹ Session ended");
-      await this.tg.closeTopic(row.group_id, row.topic_id).catch((e) => { if (!notModified(e)) this.log(`desk: couldn't close topic ${row.topic_id}: ${errText(e)}`); });
-    }
     this.state.setOffline(id);
   }
 
@@ -555,18 +550,23 @@ export class DeskRouter {
     await this.tg.send(this.opts.ownerId, undefined, text).catch((e) => this.log(`desk: couldn't tell the owner about group ${chat}: ${errText(e)}`));
   }
 
-  /** Delete ended sessions' topics that nothing touched for the TTL (default 7 days): the
-   * transcripts are local and stay, but an endless list of dead topics buries the live ones.
-   * A topic whose deletion fails is left for the next sweep. Returns how many were deleted. */
+  /** Close (never delete) topics of sessions that have been gone for the TTL (default 7 days):
+   * the topic leaves the list, the thread and its history stay, and the next /desk in that folder
+   * reopens exactly this topic. Rows are flagged so a closed topic isn't closed again each hour.
+   * A topic whose closing fails is left for the next sweep. Returns how many were newly closed. */
   async sweepStaleTopics(now = new Date()): Promise<number> {
     const ttlDays = this.opts.topicTtlDays ?? 7;
     const cutoff = new Date(now.getTime() - ttlDays * 86_400_000).toISOString().slice(0, 19).replace("T", " ");
     let swept = 0;
     for (const row of this.state.stale(cutoff)) {
       if (!row.group_id || row.topic_id === null) continue;
-      try { await this.tg.deleteTopic(row.group_id, row.topic_id); }
-      catch (e) { this.log(`desk: couldn't delete stale topic ${row.topic_id}: ${errText(e)}`); continue; }
-      this.state.clearTopic(row.id);
+      try { await this.tg.closeTopic(row.group_id, row.topic_id); }
+      catch (e) {
+        if (notModified(e)) { this.state.markClosed(row.id); continue; } // someone closed it by hand
+        this.log(`desk: couldn't close stale topic ${row.topic_id}: ${errText(e)}`);
+        continue;
+      }
+      this.state.markClosed(row.id);
       swept++;
     }
     if (swept) this.log(`desk: swept ${swept} stale topic(s)`);
@@ -682,12 +682,10 @@ export class DeskRouter {
       if (via.callbackId) await this.tg.answerCallback(via.callbackId, t).catch(() => undefined);
       else await this.post(group, via.threadId, t);
     };
-    const stale = async (t: string, note: string) => {
-      await say(t);
-      if (via.messageId && via.text) await this.tg.edit(group, via.messageId, `${via.text}\n\n${note}`).catch(() => undefined);
-    };
-    if (!conn || conn.ended) { await stale("This session has ended.", "Session ended before an answer."); return; }
-    if (via.pid !== undefined && conn.hello?.pid !== via.pid) { await stale(EARLIER_SESSION, "Session ended before an answer."); return; }
+    // Dead prompts keep their buttons: a tap just gets a toast. Nothing is written into the
+    // topic behind the owner's back, and no wording announces that a session ended.
+    if (!conn || conn.ended) { await say(NOT_CONNECTED); return; }
+    if (via.pid !== undefined && conn.hello?.pid !== via.pid) { await say(EARLIER_SESSION); return; }
     if (conn.answered.has(requestId)) { await say("Already answered."); return; }
     const p = conn.pending.get(requestId);
     if (!p || (via.callbackId !== undefined && via.messageId !== p.messageId)) {

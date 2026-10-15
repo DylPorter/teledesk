@@ -1,7 +1,7 @@
 /** Smoke test: spawn `bin/teledesk desk-channel` over real stdio, the way Claude Code
  * does, against a real desk router with a fake Telegram. Checks start-up, an owner message
  * reaching the session, a reply reaching the topic, a permission prompt answered by a tap,
- * and the topic closing when the session exits. Touches no real bot and no real data folder.
+ * and the topic staying open when the session exits. Touches no real bot and no real data folder.
  *   npm run smoke */
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -28,7 +28,7 @@ let n = 1;
 const tg: DeskTelegram = {
   getMe: async () => ({ id: 1 }), getChat: async () => ({ type: "supergroup", is_forum: true }),
   getChatMember: async () => ({ status: "administrator", can_manage_topics: true }), getChatMemberCount: async () => 2,
-  createTopic: async () => 55, editTopic: async () => {}, reopenTopic: async () => {}, deleteTopic: async () => {},
+  createTopic: async () => 55, editTopic: async () => {}, reopenTopic: async () => {},
   closeTopic: async (_c, t) => { closed.push(t); },
   send: async (_c, thread, text, buttons) => { const id = n++; sent.push({ thread, text, buttons, id }); return id; },
   edit: async () => {}, typing: async () => {}, answerCallback: async () => {},
@@ -92,8 +92,10 @@ try {
   ok(`tap became a verdict: ${JSON.stringify(verdicts[0])}`);
 
   await client.close(); // stdin closes, as when Claude Code exits
-  await wait("topic closed", () => closed.includes(55));
-  ok("session exit posted Session ended and closed the topic");
+  await new Promise((r) => setTimeout(r, 500)); // give the bye round trip (and any misbehaving close) time to show up
+  if (closed.length) throw new Error(`the session exit closed topic ${closed.join(", ")}; it must stay open`);
+  if (sent.some((s) => /Session ended|⏹/.test(s.text))) throw new Error("the session exit announced itself in the topic");
+  ok("session exit left the topic open and unannounced");
   console.log("smoke: all good");
 } finally {
   await router.stop();

@@ -218,7 +218,7 @@ export async function startDeskChannel(o: { socketPath: string; hello: Hello; tr
       },
       {
         name: "desk_off",
-        description: "Close this session's Telegram topic. This is what the owner's /desk off runs.",
+        description: "Stop relaying to this session's Telegram topic. This is what the owner's /desk off runs; the topic itself stays put and /desk picks it right back up.",
         inputSchema: { type: "object", properties: {} },
       },
     ],
@@ -239,7 +239,7 @@ export async function startDeskChannel(o: { socketPath: string; hello: Hello; tr
       activated = false;
       topicName = undefined;
       await link.detach();
-      return ok("Desk is off: the topic is closed and permission prompts are terminal-only again.");
+      return ok("Desk is off: relaying stopped and permission prompts are terminal-only again. The topic itself stays as it is; /desk turns the desk back on in it.");
     }
     if (req.params.name !== "reply") return fail(`unknown tool: ${req.params.name}`);
     const text = (req.params.arguments as { text?: unknown } | undefined)?.text;

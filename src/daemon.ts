@@ -41,7 +41,7 @@ export function helpText(state: DeskState): string {
     "",
     "Then start Claude Code with `teledesk code` (or run `teledesk install` once and plain `claude` works too). Inside a session, /desk opens its topic here: write there to talk to it, and its permission prompts show up there with Allow and Deny. /desk off closes it.",
     "",
-    "Topics of ended sessions are deleted after 7 days of inactivity (DESK_TOPIC_TTL_DAYS); the transcripts on this machine are untouched.",
+    "Topics of sessions that have been gone for 7 days leave your list (DESK_TOPIC_TTL_DAYS) but are never deleted: /desk in that folder opens the very same topic again. Transcripts on this machine are untouched.",
     "",
     `Desk group: ${state.group() ? "set up" : "not set up yet"}`,
     `Live sessions (${live.length}):`,
@@ -107,7 +107,7 @@ export class DeskDaemon {
 
   /** Stop polling and close the socket. Open sessions aren't ended: their channel servers keep
    * retrying and pick up their topics again when the daemon is back. A session that ends while
-   * the daemon is down is closed ("Session ended") when it starts again. */
+   * the daemon is down is just marked offline when it starts again; its topic stays as it was. */
   async stop(): Promise<void> {
     this.abort.abort();
     if (this.sweepTimer) { clearInterval(this.sweepTimer); this.sweepTimer = undefined; }

@@ -41,10 +41,10 @@ It uses Claude Code [channels](https://code.claude.com/docs/en/channels-referenc
 6. **Hook up your shell (recommended).** Run **`teledesk install`**: it adds a guarded `claude()` function to your `.bashrc`/`.zshrc` (so plain `claude` starts desk-capable; `teledesk uninstall` removes exactly what it added) and installs the **`/desk`** slash command into `~/.claude/commands/`. Open a new terminal afterwards.
    - Non-interactive runs (`-p`, `--output-format`, `--version`, `mcp …`, `update` and the other subcommands) are passed straight to plain `claude` without the channel, so scripts and cron jobs are unaffected.
    - Prefer no shell changes? Skip this step and start sessions with `teledesk code` explicitly (any `claude` arguments go after it). Without the installed command file, `/desk` isn't a slash command — just ask the session to "call the desk_on tool".
-7. **Use it.** Start `claude` in any folder (or `teledesk code`). The session starts **dormant**: nothing on Telegram yet. Send **`/desk`** inside the session: a topic named `<folder> · <branch>` appears in the desk group, and that topic is now the session's phone line. `/desk off` closes it again.
+7. **Use it.** Start `claude` in any folder (or `teledesk code`). The session starts **dormant**: nothing on Telegram yet. Send **`/desk`** inside the session: a topic named `<folder> · <branch>` appears in the desk group, and that topic is now the session's phone line. `/desk off` stops relaying; the topic stays exactly as it was.
    - A second session in the same folder gets `#2`. The same folder later gets its topic back.
-   - Ending the session (or killing it) posts "Session ended" and closes the topic.
-8. **Topic sweep.** Topics of ended sessions are deleted after 7 days without activity (`DESK_TOPIC_TTL_DAYS` in `.env` sets the TTL; the sweep runs hourly). Transcripts on your machine are untouched — the group just doesn't become a graveyard.
+   - Ending the session (or killing it) changes nothing on Telegram: the topic waits for the next `/desk` in that folder.
+8. **Topic sweep.** A topic whose session has been gone for 7 days (`DESK_TOPIC_TTL_DAYS` in `.env`; the sweep runs hourly) quietly leaves the group's list — closed, never deleted: `/desk` in that folder brings the same topic back with its history. Transcripts on your machine are untouched — the group just doesn't become a graveyard.
 
 Message the bot directly for a short help text and the list of live sessions.
 
@@ -53,15 +53,15 @@ Message the bot directly for a short help text and the list of live sessions.
 | You do | What happens |
 |---|---|
 | `/desk` inside a session | Its topic opens (or reopens) in the desk group; from then on the session is reachable from your phone |
-| `/desk off` inside a session | "Session ended" is posted and the topic closes; the session itself keeps running, terminal-only |
+| `/desk off` inside a session | Relaying stops and prompts go terminal-only; the session keeps running and the topic stays in the list for `/desk` to pick up right where it left off |
 | Write in a session's topic | It reaches that session only, as `<channel source="teledesk" message_id="…">` |
 | Claude calls the `reply` tool | The text appears in the topic with 🤖 in front of every part, split into parts if it's long. Nothing teledesk writes itself ever starts with 🤖, so you can always tell Claude's words from the bot's own messages and prompts. The tool is pre-allowed, so no prompt for it |
 | Claude wants to run a tool that needs approval | The prompt appears in the topic: the tool, what it does, and its input, field by field (nested fields too), **all of it, nothing hidden**. If it can't be shown in full (a field or the description longer than about 3,500 characters, more than 40 fields, or more than 4 messages in all), the topic says "This prompt is too long to show safely — answer it in the terminal", with no buttons, and no answer from Telegram counts for it. The terminal dialog stays open too, and whichever answer comes first wins |
 | Tap Allow / Deny, or type `yes abcde` / `no abcde` | The answer goes to that session. Tapping a second time does nothing |
-| Close the session | The topic says "Session ended" and closes |
+| Close the session | Nothing on Telegram: no announcement, the topic stays open for the next session of that folder |
 | Restart the daemon | Sessions reconnect by themselves and keep their topics |
 | Write in a group that isn't the desk group | The bot DMs you once (per group) that nothing there reaches a session — handy when two groups share a name |
-| Leave a dead session's topic alone for 7 days | The sweep deletes it (TTL configurable) |
+| Leave a gone session's topic alone for 7 days | The sweep closes it — out of your list, never deleted; `/desk` reopens that very topic (TTL configurable) |
 
 ## Security model
 

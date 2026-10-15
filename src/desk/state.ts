@@ -26,13 +26,15 @@ const SCHEMA = `CREATE TABLE IF NOT EXISTS desk_sessions (
   id INTEGER PRIMARY KEY, cwd TEXT NOT NULL, slot INTEGER NOT NULL,
   topic_id INTEGER, topic_name TEXT, group_id TEXT,
   status TEXT NOT NULL DEFAULT 'offline', pid INTEGER, title TEXT, branch TEXT,
-  started_at TEXT, updated_at TEXT NOT NULL DEFAULT (datetime('now')), UNIQUE(cwd, slot))`;
+  started_at TEXT, updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  topic_closed INTEGER NOT NULL DEFAULT 0, UNIQUE(cwd, slot))`;
 
 export class SqliteDeskState implements DeskState {
   constructor(private db: DatabaseSync, private meta: MetaAccess) {
     db.exec(SCHEMA);
     const cols = db.prepare("PRAGMA table_info(desk_sessions)").all() as { name: string }[];
     if (!cols.some((c) => c.name === "started_at")) db.exec("ALTER TABLE desk_sessions ADD COLUMN started_at TEXT");
+    if (!cols.some((c) => c.name === "topic_closed")) db.exec("ALTER TABLE desk_sessions ADD COLUMN topic_closed INTEGER NOT NULL DEFAULT 0");
   }
   group(): string | undefined { return this.meta.get(DESK_GROUP_KEY); }
   setGroup(chatId: string | undefined): void {
@@ -66,7 +68,8 @@ export class SqliteDeskState implements DeskState {
     } catch (e) { this.db.exec("ROLLBACK"); throw e; }
   }
   setTopic(id: number, groupId: string, topicId: number, name: string): void {
-    this.db.prepare("UPDATE desk_sessions SET group_id = ?, topic_id = ?, topic_name = ?, updated_at = datetime('now') WHERE id = ?").run(groupId, topicId, name, id);
+    // Attaching a session to a topic (new or reopened) puts it back under sweep watch.
+    this.db.prepare("UPDATE desk_sessions SET group_id = ?, topic_id = ?, topic_name = ?, topic_closed = 0, updated_at = datetime('now') WHERE id = ?").run(groupId, topicId, name, id);
   }
   setOffline(id: number): void {
     this.db.prepare("UPDATE desk_sessions SET status = 'offline', pid = NULL, updated_at = datetime('now') WHERE id = ?").run(id);
@@ -75,9 +78,10 @@ export class SqliteDeskState implements DeskState {
     return this.db.prepare("SELECT * FROM desk_sessions WHERE group_id = ? AND topic_id = ? ORDER BY id DESC LIMIT 1").get(groupId, topicId) as DeskSessionRow | undefined;
   }
   stale(cutoff: string): DeskSessionRow[] {
-    return this.db.prepare("SELECT * FROM desk_sessions WHERE status = 'offline' AND topic_id IS NOT NULL AND group_id IS NOT NULL AND updated_at < ? ORDER BY id").all(cutoff) as unknown as DeskSessionRow[];
+    return this.db.prepare("SELECT * FROM desk_sessions WHERE status = 'offline' AND topic_id IS NOT NULL AND group_id IS NOT NULL AND topic_closed = 0 AND updated_at < ? ORDER BY id").all(cutoff) as unknown as DeskSessionRow[];
   }
-  clearTopic(id: number): void {
-    this.db.prepare("UPDATE desk_sessions SET topic_id = NULL, topic_name = NULL, group_id = NULL, updated_at = datetime('now') WHERE id = ?").run(id);
+  markClosed(id: number): void {
+    // updated_at deliberately stays: the sweep is a one-way flag flip after that.
+    this.db.prepare("UPDATE desk_sessions SET topic_closed = 1 WHERE id = ?").run(id);
   }
 }

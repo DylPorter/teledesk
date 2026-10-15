@@ -44,7 +44,7 @@ export function uninstallBlock(rc: string): string {
 
 /** The /desk slash command (user scope, so it exists in every project). */
 export const DESK_COMMAND = `---
-description: Open this session's Telegram topic ("/desk off" closes it)
+description: Open this session's Telegram topic ("/desk off" stops relaying; the topic stays)
 allowed-tools: mcp__teledesk__desk_on, mcp__teledesk__desk_off
 ---
 If the user's argument is "off", call the mcp__teledesk__desk_off tool. Otherwise call the mcp__teledesk__desk_on tool. Then tell the user in one short line what happened (the topic name, or why it couldn't open). Do nothing else.
