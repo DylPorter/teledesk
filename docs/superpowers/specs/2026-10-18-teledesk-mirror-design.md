@@ -57,6 +57,11 @@ model-mediated, and that mediation is what broke.
    changes. Dylan explicitly rejected live-editing a single message across cycles
    ("those cycles get fucked up") and rejected per-tool-call granularity
    (a 50-tool turn = 50 bubbles). Send-then-edit per batch, rinse and repeat.
+3. **Capped snapshot at activation.** `/desk` on an already-running session first
+   mirrors the recent chat — last ≤5 turns, prompts + final answers, truncated —
+   as one context block, then live-mirrors forward. Chosen over forward-only
+   (Dylan, 2026-10-18); backfill is the one feature that can't be retrofitted
+   daemon-side, because only the hook side ever sees `transcript_path`.
 
 ## Architecture
 
@@ -93,32 +98,41 @@ New `ChannelMessage` variant, used only by the short-lived mirror CLI (not the
 persistent channel link):
 
 ```
-{ type: "mirror", token: <128-bit hex>, kind, ...payload }
+{ type: "mirror", token: <128-bit hex>, session_id, kind, ...payload }
 kind: "user_prompt" { text }
     | "assistant"   { text }
     | "tool_start"  { tool_name, summary }
     | "tool_end"    { tool_name, ok, summary }
     | "turn_end"    {}
+    | "history"     { text }   // capped context snapshot, sent once on desk_on
 ```
 
-All text fields bounded (reuse `text()` / `short()`). The `reply` variant and its
-router branch (`router.ts:382`) are **deleted**; `REPLY_MARK` ("🤖 ") is kept and
-reused for mirrored assistant text.
+All text fields bounded (reuse `text()` / `short()`). `session_id` is the Claude
+Code session UUID from the hook JSON, on every line — see Session binding below.
+The `reply` variant and its router branch (`router.ts:382`) are **deleted**;
+`REPLY_MARK` ("🤖 ") is kept and reused for mirrored assistant text.
 
 ### Mirror CLI (`teledesk mirror`)
 
 - New subcommand; argv-shim fast-classified (`argv.ts`, per the #18 lesson) though
   it does boot node — see latency below.
 - Reads the hook JSON on stdin, emits one protocol line to the desk socket, exits 0.
-- **Never blocks the session:** socket connect + write under a ~1.5s hard timeout;
-  every error path exits 0. Because PreToolUse runs *before* the tool, latency
-  matters: the installer's hook command backgrounds the CLI
-  (`(teledesk mirror … &) >/dev/null 2>&1` or equivalent detached spawn) so the
-  hook returns immediately; a lost progress bubble on crash is acceptable
-  (ephemeral data), a lost *assistant* bubble is not — Stop/UserPromptSubmit
-  hooks may instead run foreground with the short timeout. Builder verifies which
-  hook events CC actually waits on and picks per-event (my call, constrained by
-  "never perceptibly slow a tool call").
+- **Never blocks the session — decided split (builder-check resolution):** every
+  error path exits 0; socket connect + write under a ~1.5s hard timeout.
+  **Chat hooks run foreground** — UserPromptSubmit and Stop fire once per turn at
+  ~0.1–0.3s target (the `mirror` entrypoint is a light dedicated path, not the
+  full launcher boot): imperceptible, and foreground means the chat itself is
+  strictly ordered. **Tool hooks run backgrounded/detached**
+  (`(teledesk mirror … &) >/dev/null 2>&1` or equivalent) — zero added latency
+  per tool call (#18's lesson: node boot per spawn was the whole complaint);
+  no ordering guarantee, so the daemon-side state machine is order-tolerant.
+  A lost progress bubble is acceptable (ephemeral); chat bubbles are never
+  backgrounded, so they're never lost or reordered.
+- **desk_on extraction mode (the capped snapshot):** the PostToolUse event with
+  `tool_name == "desk_on"` runs foreground, reads `transcript_path`, extracts the
+  last ≤5 turns (user prompt text + assistant text blocks, each truncated to
+  ~500 chars, role-marked) and sends one `history` line. No new hook event is
+  needed — desk_on is itself a tool call, so PostToolUse already fires on it.
 - Per-event extraction:
   - `UserPromptSubmit`: prompt text from hook JSON.
   - `PreToolUse` / `PostToolUse`: `tool_name` + compact summary from
@@ -164,6 +178,47 @@ Message handling:
   (ephemeral), queue prompts/answers (small bounded queue, newest-wins on
   overflow). Tool bubbles are the pressure valve; the chat itself is never dropped.
 
+Order tolerance (backgrounded tool events — builder-check resolution):
+
+- Batch counters are monotonic: daemon tracks `starts_seen`/`ends_seen` per
+  batch; displayed count = max of the two; late or duplicate events fold in and
+  never regress the count or `last_summary`.
+- **A closed batch never reopens.** A tool event arriving after its batch's
+  `turn_end` (or after a different-type batch replaced it) is dropped —
+  resurrecting a "running…" bubble after the ✅ close is the exact failure class
+  Dylan rejected; a rare dropped late progress detail is the cheaper cost.
+- `tool_end` with no open batch → ignored (ephemeral).
+
+Session binding (nested-process defence — builder-check addition):
+
+- Every mirror line carries the hook JSON's `session_id`. The daemon binds
+  token→session_id on the first mirror line per token and drops later lines whose
+  session_id differs. This filters nested `claude -p` children (test harnesses,
+  spawned scripts) that inherit `TELEDESK_MIRROR` but have their own session_id —
+  otherwise their traffic would land in the topic as if the parent said it.
+- Dependency on spike #1: if Task-subagent hook events carry a *different*
+  session_id than the parent, subagent coverage wins over nested filtering (the
+  23h-background-job case is what motivated this design) — binding flips to
+  accept-and-mark (bubbles tagged "nested") instead of drop. The spike decides
+  which rule ships; the `session_id` field exists from day one either way.
+
+`history` handling: posted as one context block with a distinct header (📜 — my
+call), chunked via `chunkText`, before any live bubbles of that activation.
+Bounded client-side; daemon re-checks against `MAX_TEXT_BYTES`.
+
+Reviewer notes folded in (treat as requirements):
+
+- The user-prompt dedupe must strip the harness's `<channel …>` wrapper from both
+  sides before comparing (phone-injected text, if it fires UserPromptSubmit at
+  all, arrives wrapped).
+- Mirror pacing/rate state is keyed **per session row**, not per connection —
+  mirror connections are transient, one per event.
+- `desk: false` launches must strip `TELEDESK_MIRROR` from the child env (the
+  launcher currently deletes only `TELEDESK`).
+- Pre-upgrade sessions will still emit `reply` lines after the daemon upgrades:
+  decode-and-ignore with a log line (keep the variant as a no-op or rely on the
+  tolerant decode) — never crash the connection.
+
 ### Channel (`channel.ts`)
 
 - `INSTRUCTIONS` shrinks to near-nothing — enough for `/desk` to function:
@@ -200,12 +255,18 @@ Message handling:
 | Hook CLI crash | exit 0 contract; at worst a missing bubble |
 | Session dies mid-batch | dangling "🔧 running…" bubble; closed visually by the next session's traffic being separate messages — accepted |
 | Background subagent tool calls | **to verify** (below); if they fire hooks, they mirror — desirable (that's the 23h-job case), but volume rides on the collapse + rate budget |
+| Nested `claude -p` inherits the token | session_id binding drops mismatched lines (spike #1 may flip this to accept-and-mark) |
+| Out-of-order backgrounded events | order-tolerant batch rules: monotonic counters, closed batches never reopen, late events dropped |
+| Pre-upgrade session sends `reply` | decode-and-ignore with a log line; connection survives |
 
 ## To verify before/during implementation (spike list)
 
 1. Do `PreToolUse`/`PostToolUse`/`Stop` fire for **Task-subagent** tool calls and
-   turns, in the parent session's hook config? (Determines whether the poster-run
-   case is covered automatically or needs `SubagentStop` too.)
+   turns, in the parent session's hook config — and which `session_id` do those
+   events carry? (Determines whether the poster-run case is covered automatically
+   or needs `SubagentStop` too, and which session-binding rule ships: parent id →
+   binding safely filters nested processes; different id → accept-and-mark to
+   keep subagent coverage.)
 2. Does `UserPromptSubmit` fire for **channel-injected** messages? If yes, the
    daemon dedupe is load-bearing; if no, phone prompts simply never hit the CLI
    (fine — they're already on the phone).
@@ -266,10 +327,10 @@ Message handling:
 
 ## Left to the builder
 
-- Per-event foreground-vs-background hook execution (constrained by spike #4 and
-  the never-slow rule).
 - Exact bubble text templates and emoji set (constraint: router-written text must
   stay visually distinct from Dylan's, per the `REPLY_MARK` convention).
+- History-block formatting (role markers, per-turn truncation — defaults: ≤5
+  turns, ~500 chars each).
 - Truncation lengths, queue caps, and the mirror rate budget's exact numbers
   (defaults proposed above).
 - Whether `SubagentStop` is needed on top of `Stop` (spike #1 decides).
