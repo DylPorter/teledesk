@@ -13,7 +13,7 @@ import {
   stripChannelWrapper, toolEndSummary, toolStartSummary, type HookInput,
 } from "../src/desk/mirror-hook.js";
 import { runClaude } from "../src/desk/launcher.js";
-import { DeskRouter, REPLY_MARK, type DeskLimits } from "../src/desk/router.js";
+import { DeskRouter, REPLY_MARK, TOOL_ICONS, type DeskLimits } from "../src/desk/router.js";
 import { SqliteDeskState } from "../src/desk/state.js";
 import { REPO_ROOT } from "../src/paths.js";
 import { FakeTelegram, G, GROUP, OWNER, tmp, until } from "./helpers.js";
@@ -607,5 +607,195 @@ describe("daemon chat mirror", () => {
     const got = await mirrorSocket(socketPath, mirror({ kind: "user_prompt", text: "after the end" }));
     expect(got).toBe("");
     expect(tg.inTopic(d.topic).filter((t) => t.startsWith("🧑 ")).length).toBe(0);
+  });
+});
+
+// ---- daemon: the order-tolerant tool batch machine ----
+
+describe("tool batches", () => {
+  /** Start the turn the way the terminal's hooks do: a prompt line, posted, gate open. */
+  const openGate = async (socketPath: string, tg: FakeTelegram, topic: number) => {
+    await mirrorSocket(socketPath, mirror({ kind: "user_prompt", text: "go" }));
+    await until(() => tg.inTopic(topic).includes("🧑 go"));
+  };
+  const bubbles = (tg: FakeTelegram, prefix: string) => tg.sent.filter((s) => s.text.startsWith(prefix));
+
+  it("three reads collapse into one edited bubble", async () => {
+    const { tg, socketPath, open } = await deskSetup();
+    const d = await open("/w/proj", 11, TOKEN);
+    await openGate(socketPath, tg, d.topic);
+    for (const f of ["one.md", "two.md", "three.md"]) {
+      await mirrorSocket(socketPath, mirror({ kind: "tool_start", tool_name: "Read", summary: f }));
+      await mirrorSocket(socketPath, mirror({ kind: "tool_end", tool_name: "Read", ok: true, summary: "read it" }));
+    }
+    // One message for the whole run: a single send, every fold an edit of that same message.
+    const run = bubbles(tg, "📖 Read");
+    expect(run).toHaveLength(1);
+    expect(run[0].text).toBe("📖 Read: one.md");
+    expect(tg.edits.every((e) => e.id === run[0].id)).toBe(true);
+    expect(tg.edits[tg.edits.length - 1].text).toBe("📖 Read ×3 … read it");
+  });
+
+  it("a type change closes the batch and opens a new bubble", async () => {
+    const { tg, socketPath, open } = await deskSetup();
+    const d = await open("/w/proj", 11, TOKEN);
+    await openGate(socketPath, tg, d.topic);
+    await mirrorSocket(socketPath, mirror({ kind: "tool_start", tool_name: "Read", summary: "a.ts" }));
+    await until(() => bubbles(tg, "📖 Read").length > 0);
+    await mirrorSocket(socketPath, mirror({ kind: "tool_end", tool_name: "Read", ok: true, summary: "read" }));
+    await until(() => tg.edits.length > 0);
+    await mirrorSocket(socketPath, mirror({ kind: "tool_start", tool_name: "Bash", summary: "ls -la" }));
+    await until(() => bubbles(tg, "🖥 Bash").length > 0);
+    expect(bubbles(tg, "📖 Read")).toHaveLength(1);
+    expect(bubbles(tg, "🖥 Bash")).toHaveLength(1);
+    // The Read batch was closed with a final edit of its own bubble, not a new message.
+    const closing = tg.edits.find((e) => e.text.startsWith("✅ Read"));
+    expect(closing).toBeDefined();
+    expect(closing!.text).toBe("✅ Read ×1 — read");
+    expect(closing!.id).toBe(bubbles(tg, "📖 Read")[0].id);
+  });
+
+  it("turn_end closes the batch; a late tool_start is dropped", async () => {
+    const { tg, socketPath, open } = await deskSetup();
+    const d = await open("/w/proj", 11, TOKEN);
+    await openGate(socketPath, tg, d.topic);
+    await mirrorSocket(socketPath, mirror({ kind: "tool_start", tool_name: "Bash", summary: "echo hi" }));
+    await until(() => bubbles(tg, "🖥 Bash").length > 0);
+    await mirrorSocket(socketPath, mirror({ kind: "turn_end" }));
+    await until(() => tg.edits.some((e) => e.text.startsWith("✅ Bash")));
+    // The turn is over: its stragglers post nothing — no new bubble, and no edit resurrecting
+    // the one that just closed with ✅.
+    const n = tg.sent.length;
+    const m = tg.edits.length;
+    await mirrorSocket(socketPath, mirror({ kind: "tool_start", tool_name: "Bash", summary: "straggler" }));
+    await mirrorSocket(socketPath, mirror({ kind: "tool_end", tool_name: "Bash", ok: true, summary: "straggler done" }));
+    expect(tg.sent.length).toBe(n);
+    expect(tg.edits.length).toBe(m);
+    // A new turn reopens the gate, and its tools bubble normally again.
+    await mirrorSocket(socketPath, mirror({ kind: "user_prompt", text: "again" }));
+    await until(() => tg.inTopic(d.topic).includes("🧑 again"));
+    await mirrorSocket(socketPath, mirror({ kind: "tool_start", tool_name: "Read", summary: "note.md" }));
+    await until(() => bubbles(tg, "📖 Read").length > 0);
+    expect(bubbles(tg, "📖 Read")[0].text).toBe("📖 Read: note.md");
+  });
+
+  it("out-of-order ends never regress the counter", async () => {
+    const { tg, socketPath, open } = await deskSetup();
+    const d = await open("/w/proj", 11, TOKEN);
+    await openGate(socketPath, tg, d.topic);
+    // Ends arriving before any start: ephemeral, nothing opens and nothing queues up.
+    await mirrorSocket(socketPath, mirror({ kind: "tool_end", tool_name: "Read", ok: true, summary: "early one" }));
+    await mirrorSocket(socketPath, mirror({ kind: "tool_end", tool_name: "Read", ok: true, summary: "early two" }));
+    expect(bubbles(tg, "📖 Read")).toHaveLength(0);
+    expect(tg.edits).toHaveLength(0);
+    await mirrorSocket(socketPath, mirror({ kind: "tool_start", tool_name: "Read", summary: "f.ts" }));
+    await until(() => bubbles(tg, "📖 Read").length > 0);
+    await mirrorSocket(socketPath, mirror({ kind: "tool_end", tool_name: "Read", ok: true, summary: "done f" }));
+    await mirrorSocket(socketPath, mirror({ kind: "tool_start", tool_name: "Read", summary: "g.ts" }));
+    await mirrorSocket(socketPath, mirror({ kind: "tool_end", tool_name: "Read", ok: true, summary: "done g" }));
+    await until(() => tg.edits.length >= 3);
+    // Every edit of the one bubble carries a count that never went backwards.
+    const counts = tg.edits.map((e) => Number(/×(\d+)/.exec(e.text)?.[1] ?? -1));
+    expect(counts.every((c) => c >= 0)).toBe(true);
+    for (let i = 1; i < counts.length; i++) expect(counts[i]).toBeGreaterThanOrEqual(counts[i - 1]);
+    expect(bubbles(tg, "📖 Read")).toHaveLength(1);
+    expect(tg.edits[tg.edits.length - 1].text).toBe("📖 Read ×2 … done g");
+  });
+
+  it("edit failure falls back to a new message and repoints the batch", async () => {
+    const { tg, socketPath, open } = await deskSetup();
+    const d = await open("/w/proj", 11, TOKEN);
+    await openGate(socketPath, tg, d.topic);
+    await mirrorSocket(socketPath, mirror({ kind: "tool_start", tool_name: "Read", summary: "a.ts" }));
+    await until(() => bubbles(tg, "📖 Read").length > 0);
+    const bubble = bubbles(tg, "📖 Read")[0];
+    // The next edit throws once (message deleted, say): the result must not be lost.
+    const realEdit = tg.edit.bind(tg);
+    let threw = false;
+    tg.edit = async (chat: string, id: number, text: string) => {
+      if (!threw) { threw = true; throw new Error("telegram editMessageText: Bad Request: message to edit not found"); }
+      return realEdit(chat, id, text);
+    };
+    await mirrorSocket(socketPath, mirror({ kind: "tool_end", tool_name: "Read", ok: true, summary: "result text" }));
+    const fallback = tg.sent.find((s) => s.text === "📖 Read ×1 … result text");
+    expect(fallback).toBeDefined();
+    expect(fallback!.id).not.toBe(bubble.id);
+    // The batch now lives at the fallback message: a later end edits that one.
+    await mirrorSocket(socketPath, mirror({ kind: "tool_end", tool_name: "Read", ok: true, summary: "second" }));
+    await until(() => tg.edits.length > 0);
+    expect(tg.edits).toHaveLength(1);
+    expect(tg.edits[0].id).toBe(fallback!.id);
+    expect(tg.edits[0].text).toBe("📖 Read ×2 … second");
+  });
+
+  it("over budget, tool bubbles drop while chat flows", async () => {
+    const { tg, socketPath, open } = await deskSetup({ mirrorSendsPerMinute: 2 });
+    const d = await open("/w/proj", 11, TOKEN);
+    await openGate(socketPath, tg, d.topic); // 1 slot
+    await mirrorSocket(socketPath, mirror({ kind: "tool_start", tool_name: "Bash", summary: "one" })); // 2nd slot, bubbles
+    await until(() => bubbles(tg, "🖥 Bash").length > 0);
+    await mirrorSocket(socketPath, mirror({ kind: "tool_start", tool_name: "Read", summary: "two" })); // over budget: bubble skipped entirely
+    await until(() => tg.edits.some((e) => e.text.startsWith("✅ Bash"))); // its close was an edit, which costs no budget
+    expect(bubbles(tg, "📖 Read")).toHaveLength(0);
+    // Chat is never dropped for pacing: it waits and posts.
+    await mirrorSocket(socketPath, mirror({ kind: "user_prompt", text: "chat still flows" }));
+    await until(() => tg.inTopic(d.topic).includes("🧑 chat still flows"), 4000);
+  });
+
+  it("a failed tool closes with ❌", async () => {
+    const { tg, socketPath, open } = await deskSetup();
+    const d = await open("/w/proj", 11, TOKEN);
+    await openGate(socketPath, tg, d.topic);
+    await mirrorSocket(socketPath, mirror({ kind: "tool_start", tool_name: "Bash", summary: "false" }));
+    await until(() => bubbles(tg, "🖥 Bash").length > 0);
+    await mirrorSocket(socketPath, mirror({ kind: "tool_end", tool_name: "Bash", ok: false, summary: "exit 1" }));
+    await mirrorSocket(socketPath, mirror({ kind: "turn_end" }));
+    await until(() => tg.edits.some((e) => e.text.startsWith("❌")), 4000);
+    expect(tg.edits[tg.edits.length - 1].text).toBe("❌ Bash ×1 — exit 1");
+  });
+
+  it("the icon table is pinned and an unlisted tool gets the wrench", async () => {
+    expect(TOOL_ICONS).toMatchObject({
+      Bash: "🖥", Read: "📖", Edit: "✏️", Write: "📝", Grep: "🔍", Glob: "🔍",
+      Agent: "🧵", Task: "🧵", WebSearch: "🌐",
+    });
+    const { tg, socketPath, open } = await deskSetup();
+    const d = await open("/w/proj", 11, TOKEN);
+    await openGate(socketPath, tg, d.topic);
+    await mirrorSocket(socketPath, mirror({ kind: "tool_start", tool_name: "Sketch", summary: "a blob" }));
+    await until(() => bubbles(tg, "🔧 Sketch").length > 0);
+    expect(bubbles(tg, "🔧 Sketch")[0].text).toBe("🔧 Sketch: a blob");
+  });
+
+  // Ruling 16: a phone-initiated turn may never fire UserPromptSubmit — the injection itself
+  // opens the gate, or that whole turn's tool bubbles would silently drop.
+  it("an injected message opens the gate for tool bubbles", async () => {
+    const { tg, router, socketPath, open } = await deskSetup();
+    const d = await open("/w/proj", 11, TOKEN);
+    await router.onUpdate(say("ping", d.topic));
+    await d.c.wait("message");
+    await mirrorSocket(socketPath, mirror({ kind: "tool_start", tool_name: "Bash", summary: "ls" }));
+    await until(() => bubbles(tg, "🖥 Bash").length > 0);
+    expect(bubbles(tg, "🖥 Bash")[0].text).toBe("🖥 Bash: ls");
+  });
+
+  // Ruling 17: a bye already in flight on a connection that has just been superseded must not
+  // tear down the mirror link the rebind handed to its replacement.
+  it("a superseded connection's bye leaves the mirror link standing", async () => {
+    const { tg, state, socketPath, open } = await deskSetup({ mirrorSendsPerMinute: 1 });
+    const d = await open("/w/proj", 11, TOKEN);
+    // Everything the old connection has to say goes in before the rebind — the daemon's queue for
+    // it then works through: a posted line, a ~500 ms budget sleep, the bye, and a line after it.
+    d.c.send(mirror({ kind: "user_prompt", text: "go" })); // uses the one budget slot
+    d.c.send(mirror({ kind: "user_prompt", text: "held up" })); // its handler sleeps, queueing everything behind it
+    d.c.send({ type: "bye" });
+    d.c.send(mirror({ kind: "user_prompt", text: "after the bye" }));
+    const b = await open("/w/proj", 11, TOKEN); // the rebind lands inside that sleep: same row, d is superseded
+    expect(b.sid).toBe(d.sid);
+    expect(b.topic).toBe(d.topic);
+    // The bye's endSession runs against a superseded connection: it must tear down nothing.
+    await until(() => tg.inTopic(d.topic).includes("🧑 after the bye"), 4000);
+    expect(tg.inTopic(d.topic).includes("🧑 held up")).toBe(true);
+    expect(state.get(d.sid)!.status).toBe("live");
   });
 });

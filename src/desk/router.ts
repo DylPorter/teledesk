@@ -44,8 +44,21 @@ export const HISTORY_MARK = "📜 ";
 /** How often one session's chat snapshot may be posted. */
 export const HISTORY_COOLDOWN_MS = 120_000;
 
-/** An open run of tool calls, shown as one updating message (Task 8 fills in the edits). */
+/** An open run of consecutive same-type tool calls, shown as one message that is edited as the run goes. */
 export interface MirrorBatch { toolName: string; messageId: number; starts: number; ends: number; lastSummary: string; lastOk: boolean; }
+/** The bubble icon per tool. Both subagent spellings map to the thread: live hooks emit "Agent"
+ * on new harnesses and "Task" on older ones, and they are the same kind of run (Ruling 6). */
+export const TOOL_ICONS: Record<string, string> = {
+  Bash: "🖥", Read: "📖", Edit: "✏️", Write: "📝", Grep: "🔍", Glob: "🔍", Agent: "🧵", Task: "🧵", WebSearch: "🌐",
+};
+const toolIcon = (name: string) => TOOL_ICONS[name] ?? "🔧";
+/** The batch's three bubble shapes: `<icon> <tool>: <summary>` when a run opens,
+ * `<icon> <tool> ×<count> … <summary>` while it runs, and `✅/❌ <tool> ×<count> — <summary>`
+ * when it closes. The count is max(starts, ends): both counters only grow, so out-of-order
+ * events can never take one back. An empty summary drops its tail. */
+const startText = (name: string, summary: string) => `${toolIcon(name)} ${name}${summary ? `: ${summary}` : ""}`;
+const runText = (b: MirrorBatch, summary: string) => `${toolIcon(b.toolName)} ${b.toolName} ×${Math.max(b.starts, b.ends)}${summary ? ` … ${summary}` : ""}`;
+const doneText = (b: MirrorBatch) => `${b.lastOk ? "✅" : "❌"} ${b.toolName} ×${Math.max(b.starts, b.ends)}${b.lastSummary ? ` — ${b.lastSummary}` : ""}`;
 /** Per-session mirror state: what the phone said, what was sent recently, the open batch. */
 interface MirrorSession { batch?: MirrorBatch; gateOpen: boolean; sent: number[]; lastInjected?: string; lastHistoryAt: number; }
 
@@ -460,8 +473,9 @@ export class DeskRouter {
   }
 
   /** Room in this session's mirror send window? Chat that's over budget waits ~500 ms and is
-   * posted anyway — a mirror line is never dropped for pacing (droppable: tool lines, Task 8's
-   * callers, are skipped instead). Resolves true = post, false = skip. */
+   * posted anyway — a mirror line is never dropped for pacing (droppable: tool bubbles are
+   * skipped instead, and their edits never touch this window — only sends count).
+   * Resolves true = post, false = skip. */
   private async mirrorPace(rowId: number, droppable: boolean): Promise<boolean> {
     const st = this.mirrorSession(rowId);
     if (this.take(st.sent, this.lim.mirrorSendsPerMinute)) return true;
@@ -471,16 +485,37 @@ export class DeskRouter {
     return true;
   }
 
-  /** Close the session's open tool batch. A no-op beyond clearing the reference until Task 8
-   * replaces this body with the batch message's final edit (no Telegram call today). */
+  /** Close the session's open tool batch: its bubble gets a final ✅/❌ edit with the run's
+   * count (falling back to a fresh message if that edit fails), and the batch is cleared —
+   * a closed batch never reopens. Idempotent: nothing open, nothing done. */
   private async closeBatch(rowId: number): Promise<void> {
     const st = this.mirrorState.get(rowId);
-    if (st) st.batch = undefined;
+    const b = st?.batch;
+    if (!st || !b) return;
+    st.batch = undefined; // before the Telegram call: an event landing mid-await must never fold into a closing batch
+    const row = this.state.get(rowId);
+    if (!row || !row.group_id || row.topic_id === null) return;
+    const text = doneText(b);
+    try { await this.tg.edit(row.group_id, b.messageId, text); }
+    catch { await this.tg.send(row.group_id, row.topic_id, text).catch((e) => this.log(`desk: a batch close didn't post: ${errText(e)}`)); }
+  }
+
+  /** Edit the open batch's bubble. If Telegram can't edit it (deleted, outside the 48h window),
+   * the same text goes out as a new message and the batch re-points there: a dangling bubble is
+   * acceptable, a lost result is not. */
+  private async batchEdit(st: MirrorSession, chatId: string, threadId: number, text: string): Promise<void> {
+    const b = st.batch;
+    if (!b) return;
+    try { await this.tg.edit(chatId, b.messageId, text); }
+    catch {
+      try { b.messageId = await this.tg.send(chatId, threadId, text); }
+      catch (e) { this.log(`desk: a tool update was lost: ${errText(e)}`); }
+    }
   }
 
   /** One hook-reported line: gated by token, bound to one Claude Code session, then posted
-   * (chat kinds) or handed to Task 8 (tool kinds). Drops are silent — sessions whose desk is
-   * off mirror all day against tokens that were never registered. */
+   * (chat kinds) or folded into the session's tool batch (tool kinds). Drops are silent —
+   * sessions whose desk is off mirror all day against tokens that were never registered. */
   private async mirrorLine(m: MirrorMessage): Promise<void> {
     const rowId = this.mirrorRows.get(m.token);
     if (rowId === undefined) { this.logOnce(this.loggedMirrors, "unknown-token", "desk: dropped a mirror line from an unknown token"); return; }
@@ -521,10 +556,38 @@ export class DeskRouter {
         await this.closeBatch(rowId);
         return;
       }
-      case "tool_start":
-      case "tool_end":
-        // Tool batches are Task 8: no-op arms until then.
+      case "tool_start": {
+        // Gate closed: a straggler from a finished turn. Dropped quietly — it must neither spawn
+        // a bubble nor resurrect one its ✅ close already wrote.
+        if (!st.gateOpen) return;
+        const summary = replyText(line.summary); // transcript-sourced text gets the same scrub as every other posted line
+        const open = st.batch;
+        if (open && open.toolName === line.tool_name) {
+          open.starts++; // fold into the run; lastSummary/lastOk are end-owned, so a late start can't rewrite them
+          await this.batchEdit(st, row.group_id, row.topic_id, runText(open, summary));
+          return;
+        }
+        await this.closeBatch(rowId); // different type: the old run gets its ✅/❌ close before this one opens
+        if (!(await this.mirrorPace(rowId, true))) return; // over budget: skip the bubble entirely — nothing is stored, so the next start retries
+        const id = await this.tg.send(row.group_id, row.topic_id, startText(line.tool_name, summary)).catch((e) => {
+          this.logOnce(this.loggedMirrors, `send:${rowId}`, `desk: a tool bubble didn't send for session ${rowId}: ${errText(e)}`);
+          return undefined;
+        });
+        if (id === undefined) return;
+        st.batch = { toolName: line.tool_name, messageId: id, starts: 1, ends: 0, lastSummary: summary, lastOk: true };
         return;
+      }
+      case "tool_end": {
+        if (!st.gateOpen) return; // the same resurrection rule as tool_start
+        const open = st.batch;
+        if (!open || open.toolName !== line.tool_name) return; // an end with no open batch is ephemeral (its start hasn't arrived, or its batch closed)
+        const summary = replyText(line.summary);
+        open.ends++; // ends only grew, and only here: lastSummary/lastOk move with it, never on an ignored or gated-out event
+        open.lastSummary = summary;
+        open.lastOk = line.ok;
+        await this.batchEdit(st, row.group_id, row.topic_id, runText(open, summary));
+        return;
+      }
     }
   }
 
@@ -609,6 +672,9 @@ export class DeskRouter {
    * this folder brings the very same topic back. */
   private async endSession(conn: Conn, hide = false): Promise<void> {
     if (conn.ended) return;
+    // A superseded connection owns nothing now: a bye already in flight on it must not tear down
+    // the mirror link its rebind just established (Ruling 17).
+    if (conn.superseded) return;
     conn.ended = true;
     const id = conn.sessionId;
     if (id === undefined) return;
@@ -793,7 +859,11 @@ export class DeskRouter {
     if (v) { await this.verdict(row.id, v[2].toLowerCase(), v[1].toLowerCase().startsWith("y"), { threadId: thread }); return; }
     // Record it before the write: if UserPromptSubmit echoes this text back as a mirror line,
     // the echo's connection may be served before this one finishes.
-    this.mirrorSession(row.id).lastInjected = text;
+    const st = this.mirrorSession(row.id);
+    st.lastInjected = text;
+    // The injection is itself the turn-start signal: a phone-initiated turn may never fire
+    // UserPromptSubmit (Ruling 16), so the gate opens here too or that turn's tool bubbles drop.
+    st.gateOpen = true;
     this.write(conn, { type: "message", text, message_id: u.messageId });
     void this.tg.typing(chat, thread).catch(() => undefined);
   }
