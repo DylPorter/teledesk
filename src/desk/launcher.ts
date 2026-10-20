@@ -6,7 +6,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { renameSync, writeFileSync } from "node:fs";
 import { constants } from "node:os";
-import { CHANNEL_NAME, ENV_GUARD } from "./channel.js";
+import { CHANNEL_NAME, ENV_GUARD, ENV_MIRROR } from "./channel.js";
 import { ENV_SHIM } from "./shim.js";
 
 /** The MCP config that defines the channel server. No env here: the guard variable comes
@@ -54,11 +54,18 @@ export function claudeVersion(claude = "claude"): string | undefined {
   catch { return undefined; }
 }
 
+/** A per-spawn secret for the mirror channel: 16 random bytes as hex, which is exactly
+ * what the protocol's MIRROR_TOKEN regex accepts. */
+export function newMirrorToken(): string {
+  return randomBytes(16).toString("hex");
+}
+
 /** Run claude in this terminal and return its exit code. With `desk: false`, plain claude
- * (and the guard variable is removed, in case this runs inside a desk session). */
+ * (and the guard and mirror variables are removed, in case this runs inside a desk session). */
 export function runClaude(o: { args: string[]; desk: boolean; claude?: string; env?: NodeJS.ProcessEnv }): Promise<number> {
   const env: NodeJS.ProcessEnv = { ...(o.env ?? process.env) };
   if (o.desk) env[ENV_GUARD] = "1"; else delete env[ENV_GUARD];
+  if (o.desk) env[ENV_MIRROR] = newMirrorToken(); else delete env[ENV_MIRROR];
   // This child must be the real binary. With the PATH shim installed (`teledesk install --shim`),
   // spawning the bare name `claude` would find the shim again, and the shim would hand back to
   // `teledesk code` — an infinite loop that this one variable ends. Set on both paths: the plain

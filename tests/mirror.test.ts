@@ -1,6 +1,11 @@
-/** Tests for the mirror protocol line: the token-gated hook message. */
+/** Tests for the mirror protocol line: the token-gated hook message, and the launcher
+ * that mints the token into the session's child env. */
 import { describe, expect, it } from "vitest";
-import { ChannelMessage, decode, encode, type MirrorMessage } from "../src/desk/protocol.js";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { ChannelMessage, decode, encode, MIRROR_TOKEN, type MirrorMessage } from "../src/desk/protocol.js";
+import { runClaude } from "../src/desk/launcher.js";
+import { tmp } from "./helpers.js";
 
 const TOKEN = "0123456789abcdef0123456789abcdef";
 const CC = "3f9a1c2b-0d4e-4a7b-8c5d-1e2f3a4b5c6d";
@@ -47,5 +52,31 @@ describe("mirror protocol", () => {
       expect(bad({ type: "mirror", token: TOKEN, cc_session: CC, line: { ...line, extra: 1 } })).toBeUndefined();
     }
     expect(bad({ type: "mirror", token: TOKEN, cc_session: CC, line: { kind: "turn_end" }, extra: 1 })).toBeUndefined();
+  });
+});
+
+describe("launcher token", () => {
+  /** Run runClaude with node as the "claude": the child writes the mirror token it received. */
+  const childSaw = async (desk: boolean, env: NodeJS.ProcessEnv): Promise<string> => {
+    const marker = join(tmp(), "token");
+    const probe = ["-e", `require("node:fs").writeFileSync(${JSON.stringify(marker)}, process.env.TELEDESK_MIRROR ?? "")`];
+    expect(await runClaude({ args: probe, desk, claude: process.execPath, env })).toBe(0);
+    return readFileSync(marker, "utf8");
+  };
+
+  it("desk:true gives the child a fresh 32-hex token", async () => {
+    expect(await childSaw(true, {})).toMatch(MIRROR_TOKEN);
+  });
+
+  it("two launches mint different tokens", async () => {
+    const a = await childSaw(true, {});
+    const b = await childSaw(true, {});
+    expect(a).toMatch(MIRROR_TOKEN);
+    expect(b).toMatch(MIRROR_TOKEN);
+    expect(a).not.toBe(b);
+  });
+
+  it("desk:false strips the token even when the parent has one", async () => {
+    expect(await childSaw(false, { TELEDESK_MIRROR: TOKEN })).toBe("");
   });
 });

@@ -19,6 +19,9 @@ const fits = (m: ChannelMessage) => Buffer.byteLength(encode(m), "utf8") <= MAX_
 
 export const CHANNEL_NAME = "teledesk";
 export const ENV_GUARD = "TELEDESK";
+/** Per-spawn secret the launcher puts in the session's env so mirror hook processes can be
+ * tied back to this session. Lives here, not in launcher.ts, because launcher imports this. */
+export const ENV_MIRROR = "TELEDESK_MIRROR";
 export const REFUSAL = `teledesk desk-channel: not starting, because ${ENV_GUARD}=1 isn't set. This server only runs inside a session started with \`teledesk code\`, which sets it.\n`;
 
 export const INSTRUCTIONS = [
