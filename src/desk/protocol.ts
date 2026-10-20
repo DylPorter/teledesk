@@ -11,6 +11,8 @@ export const MAX_TEXT_BYTES = 64 * 1024;
 export const MAX_LINE_BYTES = 256 * 1024;
 /** Claude Code's permission request ids: five lowercase letters, no 'l'. */
 export const REQUEST_ID = /^[a-km-z]{5}$/;
+/** The token that authorises a mirror line: 32 lowercase hex chars. */
+export const MIRROR_TOKEN = /^[0-9a-f]{32}$/;
 /** A typed verdict: "yes abcde" / "no abcde" (from the channels reference). */
 export const VERDICT_TEXT = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i;
 
@@ -18,9 +20,21 @@ const text = (max = MAX_TEXT_BYTES) => z.string().refine((s) => Buffer.byteLengt
 const short = (max: number) => z.string().max(max);
 const requestId = z.string().regex(REQUEST_ID);
 
+/** One mirrored chat line, as reported by the hooks; every kind is strict. */
+export const MirrorLine = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("user_prompt"), text: text().refine((s) => s.trim().length > 0, "empty") }).strict(),
+  z.object({ kind: z.literal("assistant"), text: text().refine((s) => s.trim().length > 0, "empty") }).strict(),
+  z.object({ kind: z.literal("tool_start"), tool_name: z.string().min(1).max(256), summary: text(2048) }).strict(),
+  z.object({ kind: z.literal("tool_end"), tool_name: z.string().min(1).max(256), ok: z.boolean(), summary: text(2048) }).strict(),
+  z.object({ kind: z.literal("turn_end") }).strict(),
+  z.object({ kind: z.literal("history"), text: text().refine((s) => s.trim().length > 0, "empty") }).strict(),
+]);
+
 export const ChannelMessage = z.discriminatedUnion("type", [
-  z.object({ type: z.literal("hello"), cwd: z.string().min(1).max(4096), pid: z.number().int().positive(), title: short(256), branch: short(256).optional() }).strict(),
+  z.object({ type: z.literal("hello"), cwd: z.string().min(1).max(4096), pid: z.number().int().positive(), title: short(256), branch: short(256).optional(), mirror_token: z.string().regex(MIRROR_TOKEN).optional() }).strict(),
   z.object({ type: z.literal("reply"), text: text().refine((s) => s.trim().length > 0, "empty") }).strict(),
+  // mirror: one hook-reported line, gated by the session's token and bound to its Claude Code session.
+  z.object({ type: z.literal("mirror"), token: z.string().regex(MIRROR_TOKEN), cc_session: z.string().min(1).max(64), line: MirrorLine }).strict(),
   // too_long: the request was too big to send whole; it's shown as answer-in-the-terminal only.
   z.object({ type: z.literal("permission_request"), request_id: requestId, tool_name: z.string().min(1).max(256), description: text(), input_preview: text(), too_long: z.literal(true).optional() }).strict(),
   // hide: set only by an explicit /desk off — "take this topic off my list for now" (quietly,
@@ -28,6 +42,7 @@ export const ChannelMessage = z.discriminatedUnion("type", [
   z.object({ type: z.literal("bye"), hide: z.literal(true).optional() }).strict(),
 ]);
 export type ChannelMessage = z.infer<typeof ChannelMessage>;
+export type MirrorMessage = Extract<ChannelMessage, { type: "mirror" }>;
 
 export const DaemonMessage = z.discriminatedUnion("type", [
   z.object({ type: z.literal("welcome"), session_id: z.number().int().positive(), topic_name: short(256) }).strict(),

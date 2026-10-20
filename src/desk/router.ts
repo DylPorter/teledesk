@@ -385,7 +385,9 @@ export class DeskRouter {
       if (failed) await this.post(row.group_id, row.topic_id, `⚠️ ${failed} part(s) of that reply didn't send.`);
       return;
     }
-    await this.prompt(conn, row, m);
+    // Anything that wasn't hello/bye/reply used to be a permission prompt; mirror is new
+    // and the router ignores it until it learns to mirror.
+    if (m.type === "permission_request") await this.prompt(conn, row, m);
   }
 
   /** Post a permission prompt: details first if they need a message of their own, the buttons last.
