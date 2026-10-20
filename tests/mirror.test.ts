@@ -269,6 +269,16 @@ describe("mirror-hook classification", () => {
     expect(mirrorLinesFor({ hook_event_name: "UserPromptSubmit", session_id: CC, prompt: "   " }, env)).toEqual([]);
   });
 
+  it("a pasted multibyte prompt over the byte bound is clipped on the way out", () => {
+    // Same class as the answer clip: the CLI clips before sending, the daemon's decode re-checks —
+    // an unclipped 90KB prompt dies at the validator and the turn's input never reaches the topic.
+    const l = mirrorLinesFor({ hook_event_name: "UserPromptSubmit", session_id: CC, prompt: "漢".repeat(30_000) }, env);
+    expect(l).toHaveLength(1);
+    if (l[0]!.line.kind !== "user_prompt") throw new Error("expected a user_prompt line");
+    expect(Buffer.byteLength(l[0]!.line.text, "utf8")).toBeLessThanOrEqual(MAX_TEXT_BYTES);
+    expect(decode(ChannelMessage, encode(l[0]!))).toBeDefined();
+  });
+
   it("a tool call becomes start and end lines", () => {
     const pre = mirrorLinesFor({ hook_event_name: "PreToolUse", session_id: CC, tool_name: "Bash", tool_input: { command: "echo one" } }, env);
     expect(pre[0]).toMatchObject({ type: "mirror", token: TOKEN, cc_session: CC });
@@ -350,6 +360,18 @@ describe("transcript extraction", () => {
     expect(Buffer.byteLength(out!, "utf8")).toBeLessThanOrEqual(MAX_TEXT_BYTES);
   });
 
+  it("extractTurnAssistant clips a dense multibyte answer by UTF-8 bytes, not units", () => {
+    // 漢 is one UTF-16 unit but three UTF-8 bytes: 30k units is 90k bytes, over the daemon's bound
+    // while still under its 64k-unit length — so a clip that counts units ships the whole answer and
+    // the strict decode discards it (no bubble, no notice). The clip has to count bytes.
+    const fx = jsonl(asked("多說一點"), said("漢".repeat(30_000)));
+    const out = extractTurnAssistant(fx);
+    expect(out).toBeDefined();
+    expect(out!.length).toBeLessThanOrEqual(MAX_TEXT_BYTES); // units, which is never the binding cap
+    expect(Buffer.byteLength(out!, "utf8")).toBeLessThanOrEqual(MAX_TEXT_BYTES);
+    expect(decode(ChannelMessage, encode(mirror({ kind: "assistant", text: out! })))).toBeDefined();
+  });
+
   it("malformed lines are skipped", () => {
     const fx = jsonl(asked("hi"), "not json", '{"unclosed": ', said("there"));
     expect(extractTurnAssistant(fx)).toBe("there");
@@ -404,6 +426,16 @@ describe("transcript extraction", () => {
     for (let i = 0; i < 5; i++) rows.push(asked("w".repeat(20_000)), said("v".repeat(20_000)));
     const out = extractHistory(jsonl(...rows))!;
     expect(Buffer.byteLength(out, "utf8")).toBeLessThanOrEqual(MAX_TEXT_BYTES);
+  });
+
+  it("extractHistory's total clip is a byte cap on multibyte text too", () => {
+    // perTurnChars widened so the total clip is what binds: ~60k units of 3-byte text ≈ 180k bytes.
+    const rows: { type: string; content: unknown }[] = [];
+    for (let i = 0; i < 5; i++) rows.push(asked("漢".repeat(6_000)), said("漢".repeat(6_000)));
+    const out = extractHistory(jsonl(...rows), 5, 6_000)!;
+    expect(out.length).toBeLessThanOrEqual(MAX_TEXT_BYTES);
+    expect(Buffer.byteLength(out, "utf8")).toBeLessThanOrEqual(MAX_TEXT_BYTES);
+    expect(decode(ChannelMessage, encode(mirror({ kind: "history", text: out })))).toBeDefined();
   });
 
   it("summaries special-case Bash, Read, Task and fall back to JSON", () => {

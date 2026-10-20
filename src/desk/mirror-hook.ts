@@ -7,7 +7,7 @@
  * this CLI does one synchronous pass and stays dependency-light (protocol only). */
 import { readFileSync } from "node:fs";
 import { createConnection, type Socket } from "node:net";
-import { clip, encode, headOf, MAX_TEXT_BYTES, MIRROR_TOKEN, oneLine, type MirrorMessage } from "./protocol.js";
+import { clip, clipBytes, encode, MAX_TEXT_BYTES, MIRROR_TOKEN, oneLine, type MirrorMessage } from "./protocol.js";
 
 /** Hard cap on one hook run: connecting, writing and draining all live inside it. */
 export const MIRROR_TIMEOUT_MS = 1500;
@@ -71,8 +71,9 @@ function assistantText(rows: TranscriptRow[], start: number, end: number): strin
 
 /** The whole turn's assistant answer (a turn can span several assistant messages — the reason
  * the transcript, not the hook's last_assistant_message field, is the primary source), or
- * undefined when the turn said nothing in words. Head-clipped to MAX_TEXT_BYTES; character
- * cleaning is the daemon's job (Task 7's replyText), not ours. */
+ * undefined when the turn said nothing in words. Clipped to MAX_TEXT_BYTES counted as UTF-8
+ * bytes, which is what the daemon bounds: clip the units and a CJK answer decodes as oversized
+ * and is dropped whole. Character cleaning is the daemon's job (Task 7's replyText), not ours. */
 export function extractTurnAssistant(transcript: string): string | undefined {
   const rows = jsonLines(transcript);
   let boundary = 0;
@@ -80,12 +81,13 @@ export function extractTurnAssistant(transcript: string): string | undefined {
     if (promptOf(rows[i]!) !== undefined) { boundary = i + 1; break; }
   }
   const text = assistantText(rows, boundary, rows.length);
-  return text ? headOf(text, MAX_TEXT_BYTES) : undefined;
+  return text ? clipBytes(text, MAX_TEXT_BYTES) : undefined;
 }
 
 /** A capped snapshot of the earlier conversation for a desk opened mid-session: the last
  * `maxTurns` completed prompt→answer pairs, rendered oldest first with 🧑/🤖 marks and
- * `---` separators, each side clipped to `perTurnChars` and the total to MAX_TEXT_BYTES.
+ * `---` separators, each side clipped to `perTurnChars` (characters, by pin) and the total to
+ * MAX_TEXT_BYTES counted as UTF-8 bytes.
  * A pair is completed only when the prompt is followed by assistant text (the turn in
  * flight has none yet); undefined when the transcript holds no completed pair. */
 export function extractHistory(transcript: string, maxTurns = 5, perTurnChars = 500): string | undefined {
@@ -100,7 +102,7 @@ export function extractHistory(transcript: string, maxTurns = 5, perTurnChars = 
     if (!answer) continue;
     pairs.push(`🧑 ${clip(prompt, perTurnChars)}\n\n🤖 ${clip(answer, perTurnChars)}`);
   }
-  return pairs.length ? headOf(pairs.reverse().join("\n\n---\n\n"), MAX_TEXT_BYTES) : undefined;
+  return pairs.length ? clipBytes(pairs.reverse().join("\n\n---\n\n"), MAX_TEXT_BYTES) : undefined;
 }
 
 /** Per-tool subject of a call (ruling 6: CC 2.1.304 fires the subagent tool as `Agent`;
@@ -163,7 +165,8 @@ function classify(hook: HookInput, env: NodeJS.ProcessEnv, xf: Extractors): Mirr
   switch (hook.hook_event_name) {
     case "UserPromptSubmit": {
       const text = hook.prompt;
-      return text && text.trim() ? [msg({ kind: "user_prompt", text })] : [];
+      // clipped here too, in bytes: a pasted wall of text the daemon would reject must not be sent at all
+      return text && text.trim() ? [msg({ kind: "user_prompt", text: clipBytes(text, MAX_TEXT_BYTES) })] : [];
     }
     case "PreToolUse": {
       const tool = hook.tool_name;

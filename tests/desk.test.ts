@@ -7,7 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 import { z } from "zod";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { ChannelMessage, clip, DaemonMessage, decode, elideMiddle, LineReader, MAX_TEXT_BYTES } from "../src/desk/protocol.js";
+import { ChannelMessage, clip, clipBytes, DaemonMessage, decode, elideMiddle, LineReader, MAX_TEXT_BYTES } from "../src/desk/protocol.js";
 import { BEFORE_SESSION, DEFAULT_LIMITS, DeskRouter, REPLY_MARK, type DeskLimits, EARLIER_SESSION, FORWARD_TEXT, GENERAL_HINT, NO_GROUP_REASON, NO_PROMPT, NOT_CONNECTED, NO_SESSION_TEXT, PRIVACY_OFF, promptMessages, TEXT_ONLY, tooLongText, topicName } from "../src/desk/router.js";
 import { SqliteDeskState, sqliteMeta } from "../src/desk/state.js";
 import { REFUSAL, runDeskChannel, startDeskChannel, type DeskChannel } from "../src/desk/channel.js";
@@ -115,6 +115,35 @@ describe("desk protocol", () => {
     expect(r.push("ld\n")).toBe(true);
     expect(lines).toEqual(["héllo", "world"]);
     expect(r.push("x".repeat(101))).toBe(false);
+  });
+
+  it("clipBytes keeps the largest whole-character prefix that fits the byte bound", () => {
+    const lone = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
+    // exact-boundary fit → untouched
+    expect(clipBytes("abcd", 4)).toBe("abcd");
+    expect(clipBytes("漢漢", 6)).toBe("漢漢");
+    expect(clipBytes("😀", 4)).toBe("😀");
+    // one byte over → the smallest whole character goes
+    expect(clipBytes("abcde", 4)).toBe("abcd");
+    expect(clipBytes("漢漢漢", 8)).toBe("漢漢"); // 9 bytes → 6
+    expect(clipBytes("ab", 1)).toBe("a");
+    // a cut landing inside a surrogate pair drops the pair rather than strand half of it
+    expect(clipBytes("😀😀", 6)).toBe("😀");
+    expect(clipBytes("ab😀c", 5)).toBe("ab");
+    expect(clipBytes("漢😀", 5)).toBe("漢");
+    for (const s of ["😀😀", "ab😀c", "漢😀", "漢漢漢", "x"]) {
+      const c = clipBytes(s, 3);
+      expect(c).not.toMatch(lone);
+      expect(Buffer.byteLength(c, "utf8")).toBeLessThanOrEqual(3);
+    }
+    // no room for even one character, and the empty string, are both empty
+    expect(clipBytes("漢", 1)).toBe("");
+    expect(clipBytes("", 8)).toBe("");
+    // near-maximal: as much as the bound allows, not a crude fraction of it
+    const out = clipBytes("漢".repeat(30_000), MAX_TEXT_BYTES); // 30k units = 90k bytes
+    expect(Buffer.byteLength(out, "utf8")).toBeLessThanOrEqual(MAX_TEXT_BYTES);
+    expect(Buffer.byteLength(out, "utf8")).toBeGreaterThan(MAX_TEXT_BYTES - 3);
+    expect(out).toBe("漢".repeat(21_845)); // floor(65536 / 3); the 21,846th would run to 65538
   });
 });
 

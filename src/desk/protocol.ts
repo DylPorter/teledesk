@@ -109,6 +109,26 @@ export function tailOf(t: string, n: number): string {
   return isLow(t.charCodeAt(start)) ? t.slice(start + 1) : t.slice(start);
 }
 
+/** The longest prefix of t whose UTF-8 encoding fits `maxBytes`, never splitting a surrogate
+ * pair. Every bound in this file is counted in bytes, so anything headed for a validator uses
+ * this rather than headOf: a string's length counts UTF-16 units, and 3-byte text (CJK) carries
+ * up to three times the bytes it has units — a clip counted in units can hand over a string that
+ * looks like it fits and the daemon's strict decode then drops the message entirely. */
+export function clipBytes(t: string, maxBytes: number): string {
+  if (maxBytes <= 0) return "";
+  if (Buffer.byteLength(t, "utf8") <= maxBytes) return t;
+  // UTF-8 is never shorter than the units it came from, so maxBytes units is an upper bound on
+  // what can fit; halve down from there to the largest prefix that encodes inside the bound.
+  let lo = 0;
+  let hi = Math.min(t.length, maxBytes);
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (Buffer.byteLength(headOf(t, mid), "utf8") <= maxBytes) lo = mid;
+    else hi = mid - 1;
+  }
+  return headOf(t, lo);
+}
+
 /** Trim to at most n characters, marking the cut (for names and labels, never for anything approved). */
 export function clip(t: string, n: number): string {
   return t.length <= n ? t : `${headOf(t, Math.max(0, n - 1))}…`;
