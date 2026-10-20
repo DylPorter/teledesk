@@ -7,7 +7,7 @@
  * this CLI does one synchronous pass and stays dependency-light (protocol only). */
 import { readFileSync } from "node:fs";
 import { createConnection, type Socket } from "node:net";
-import { clip, encode, MIRROR_TOKEN, oneLine, type MirrorMessage } from "./protocol.js";
+import { clip, encode, headOf, MAX_TEXT_BYTES, MIRROR_TOKEN, oneLine, type MirrorMessage } from "./protocol.js";
 
 /** Hard cap on one hook run: connecting, writing and draining all live inside it. */
 export const MIRROR_TIMEOUT_MS = 1500;
@@ -27,17 +27,101 @@ const INTERNAL_TOOLS = new Set(["ToolSearch"]);
 /** The owner's /desk runs this tool; its PostToolUse is the trigger for the 📜 history snapshot. */
 const DESK_ON_TOOL = "mcp__teledesk__desk_on";
 
-/** Task 6 replaces this stub (last assistant text of the turn from the transcript JSONL). */
-export function extractTurnAssistant(_transcript: string): string | undefined { return undefined; }
+/** One transcript row as far as extraction cares (spike (a): the file is
+ * `~/.claude/projects/<cwd-encoded>/<session_id>.jsonl`, one JSON object per line). */
+interface TranscriptRow { type?: unknown; message?: { content?: unknown } }
 
-/** Task 6 replaces this stub (a capped snapshot of the earlier conversation). */
-export function extractHistory(_transcript: string, _maxTurns?: number, _perTurnChars?: number): string | undefined { return undefined; }
+/** JSONL → rows; malformed lines are skipped, never thrown on — a torn last line must not
+ * cost the hook the rest of the turn. */
+function jsonLines(transcript: string): TranscriptRow[] {
+  const rows: TranscriptRow[] = [];
+  for (const line of transcript.split("\n")) {
+    if (!line.trim()) continue;
+    try { rows.push(JSON.parse(line) as TranscriptRow); } catch { /* skip */ }
+  }
+  return rows;
+}
 
-/** Task 6 replaces these placeholders with per-tool summaries (incl. Agent/Task dispatch lines);
- * toolName is unused until then but stays in the signature — Task 6 pins it. */
-export function toolStartSummary(_toolName: string, input: unknown): string { return summarize(input, 200); }
-export function toolEndSummary(response: unknown): string { return summarize(response, 300); }
-const summarize = (x: unknown, n: number): string => (x === undefined ? "" : oneLine(clip(JSON.stringify(x) ?? "", n)));
+/** A turn boundary row: a `user` row whose content is the typed prompt string. Tool results
+ * are also user rows but carry array content — they do not bound a turn. */
+const promptOf = (r: TranscriptRow): string | undefined =>
+  r.type === "user" && typeof r.message?.content === "string" ? r.message.content : undefined;
+
+/** The string `text` of an array content's blocks, in order; blocks without one (tool_use,
+ * stray values) are ignored. */
+function blocksOf(content: unknown): string[] {
+  if (!Array.isArray(content)) return [];
+  const out: string[] = [];
+  for (const b of content) {
+    const t = (b as { text?: unknown } | null | undefined)?.text;
+    if (typeof t === "string" && t !== "") out.push(t);
+  }
+  return out;
+}
+
+/** Every assistant row's text blocks in rows[start, end), file order, joined "\n\n". */
+function assistantText(rows: TranscriptRow[], start: number, end: number): string {
+  const parts: string[] = [];
+  for (let i = start; i < end; i++) {
+    const r = rows[i]!;
+    if (r.type === "assistant") parts.push(...blocksOf(r.message?.content));
+  }
+  return parts.join("\n\n");
+}
+
+/** The whole turn's assistant answer (a turn can span several assistant messages — the reason
+ * the transcript, not the hook's last_assistant_message field, is the primary source), or
+ * undefined when the turn said nothing in words. Head-clipped to MAX_TEXT_BYTES; character
+ * cleaning is the daemon's job (Task 7's replyText), not ours. */
+export function extractTurnAssistant(transcript: string): string | undefined {
+  const rows = jsonLines(transcript);
+  let boundary = 0;
+  for (let i = rows.length - 1; i >= 0; i--) {
+    if (promptOf(rows[i]!) !== undefined) { boundary = i + 1; break; }
+  }
+  const text = assistantText(rows, boundary, rows.length);
+  return text ? headOf(text, MAX_TEXT_BYTES) : undefined;
+}
+
+/** A capped snapshot of the earlier conversation for a desk opened mid-session: the last
+ * `maxTurns` completed prompt→answer pairs, rendered oldest first with 🧑/🤖 marks and
+ * `---` separators, each side clipped to `perTurnChars` and the total to MAX_TEXT_BYTES.
+ * A pair is completed only when the prompt is followed by assistant text (the turn in
+ * flight has none yet); undefined when the transcript holds no completed pair. */
+export function extractHistory(transcript: string, maxTurns = 5, perTurnChars = 500): string | undefined {
+  const rows = jsonLines(transcript);
+  const pairs: string[] = []; // newest first, reversed when rendered
+  let end = rows.length;
+  for (let i = rows.length - 1; i >= 0 && pairs.length < maxTurns; i--) {
+    const prompt = promptOf(rows[i]!);
+    if (prompt === undefined) continue;
+    const answer = assistantText(rows, i + 1, end);
+    end = i;
+    if (!answer) continue;
+    pairs.push(`🧑 ${clip(prompt, perTurnChars)}\n\n🤖 ${clip(answer, perTurnChars)}`);
+  }
+  return pairs.length ? headOf(pairs.reverse().join("\n\n---\n\n"), MAX_TEXT_BYTES) : undefined;
+}
+
+/** Per-tool subject of a call (ruling 6: CC 2.1.304 fires the subagent tool as `Agent`;
+ * `Task` is the older build's name — both are special-cased). Inputs shaped differently
+ * fall back to the JSON of the whole input. */
+const TOOL_START_FIELD: Record<string, string> = {
+  Bash: "command", Read: "file_path", Edit: "file_path", Write: "file_path", NotebookEdit: "file_path",
+  Agent: "description", Task: "description", Grep: "pattern", Glob: "pattern", WebSearch: "query",
+};
+
+export function toolStartSummary(toolName: string, input: unknown): string {
+  if (input === undefined || input === null) return "";
+  const field = TOOL_START_FIELD[toolName];
+  const value = field ? (input as Record<string, unknown>)[field] : undefined;
+  return oneLine(clip(typeof value === "string" ? value : (JSON.stringify(input) ?? ""), 200));
+}
+
+export function toolEndSummary(response: unknown): string {
+  if (response === undefined || response === null) return "";
+  return oneLine(clip(typeof response === "string" ? response : (JSON.stringify(response) ?? ""), 300));
+}
 
 /** The wrapper phone-injected messages arrive in (spike (e) form:
  * `<channel source="teledesk" message_id="…">text</channel>`); unwrapped text is unchanged.

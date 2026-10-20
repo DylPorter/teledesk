@@ -2,12 +2,15 @@
  * that mints the token into the session's child env, the channel hello that carries it,
  * and the mirror-hook CLI that classifies hook JSON and transports the lines. */
 import { describe, expect, it } from "vitest";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createServer, type Socket } from "node:net";
 import { spawn } from "node:child_process";
-import { ChannelMessage, decode, encode, LineReader, MIRROR_TOKEN, type MirrorMessage } from "../src/desk/protocol.js";
-import { MIRROR_TIMEOUT_MS, mirrorLinesFor, runMirrorHook, stripChannelWrapper, type HookInput } from "../src/desk/mirror-hook.js";
+import { ChannelMessage, decode, encode, LineReader, MAX_TEXT_BYTES, MIRROR_TOKEN, type MirrorMessage } from "../src/desk/protocol.js";
+import {
+  extractHistory, extractTurnAssistant, MIRROR_TIMEOUT_MS, mirrorLinesFor, runMirrorHook,
+  stripChannelWrapper, toolEndSummary, toolStartSummary, type HookInput,
+} from "../src/desk/mirror-hook.js";
 import { runClaude } from "../src/desk/launcher.js";
 import { REPO_ROOT } from "../src/paths.js";
 import { tmp, until } from "./helpers.js";
@@ -285,13 +288,14 @@ describe("mirror-hook classification", () => {
     expect(l[0]!.line).toMatchObject({ kind: "tool_start", tool_name: "Agent" });
   });
 
-  it("desk_on asks for history, and the stub has none yet", () => {
-    // The trigger is wired; Task 6 fills extractHistory. Until then: no tool_end bubble either.
+  it("desk_on with no transcript path has no history to send", () => {
+    // The trigger reads the transcript only through transcript_path; with none there is no
+    // history line — and desk_on never becomes a tool_end bubble either.
     const l = mirrorLinesFor({ hook_event_name: "PostToolUse", session_id: CC, tool_name: "mcp__teledesk__desk_on", tool_response: [{ type: "text", text: "Desk is on" }] }, env);
     expect(l).toEqual([]);
   });
 
-  it("Stop with the stubbed extractor sends turn_end only", () => {
+  it("Stop with an unreadable transcript sends turn_end only", () => {
     const l = mirrorLinesFor({ hook_event_name: "Stop", session_id: CC, transcript_path: join(tmp(), "absent.jsonl") }, env);
     expect(kinds(l)).toEqual(["turn_end"]);
   });
@@ -301,5 +305,147 @@ describe("mirror-hook classification", () => {
     expect(stripChannelWrapper('<channel source="teledesk" message_id="42">\nlong text\n</channel>')).toBe("long text");
     const plain = "terminal-typed prompt";
     expect(stripChannelWrapper(plain)).toBe(plain);
+  });
+});
+
+describe("transcript extraction", () => {
+  /** JSONL fixture rows built as { type, message: { role, content } }; a raw string row is
+   * passed through verbatim so fixtures can carry a malformed line. */
+  const jsonl = (...rows: ({ type: string; content: unknown } | string)[]) =>
+    rows.map((r) => (typeof r === "string" ? r : JSON.stringify({ type: r.type, message: { role: r.type, content: r.content } }))).join("\n");
+  const asked = (text: string) => ({ type: "user", content: text });
+  const said = (text: string) => ({ type: "assistant", content: [{ type: "text", text }] });
+  const toolResult = (text: string) => ({ type: "user", content: [{ type: "tool_result", tool_use_id: "toolu_01", content: text }] });
+
+  it("collects assistant text after the last string-content user row", () => {
+    const fx = jsonl(
+      asked("an earlier turn"), said("the earlier answer"),
+      asked("run echo and tell me what it printed"),
+      said("I'll run it now."), toolResult("one"), said("It printed one."),
+    );
+    // Both assistant messages of the turn; the tool_result user row does not bound it.
+    expect(extractTurnAssistant(fx)).toBe("I'll run it now.\n\nIt printed one.");
+  });
+
+  it("extractTurnAssistant returns undefined for a tool-only turn", () => {
+    const fx = jsonl(
+      asked("run it"),
+      { type: "assistant", content: [{ type: "tool_use", id: "toolu_01", name: "Bash", input: { command: "echo one" } }] },
+      toolResult("one"),
+    );
+    expect(extractTurnAssistant(fx)).toBeUndefined();
+  });
+
+  it("extractTurnAssistant output is clipped to MAX_TEXT_BYTES", () => {
+    const fx = jsonl(asked("say it big"), said("x".repeat(70 * 1024)));
+    const out = extractTurnAssistant(fx);
+    expect(out).toBeDefined();
+    expect(Buffer.byteLength(out!, "utf8")).toBeLessThanOrEqual(MAX_TEXT_BYTES);
+  });
+
+  it("malformed lines are skipped", () => {
+    const fx = jsonl(asked("hi"), "not json", '{"unclosed": ', said("there"));
+    expect(extractTurnAssistant(fx)).toBe("there");
+    expect(extractHistory(jsonl(asked("one"), "not json", said("a1"), asked("two"), "{oops", said("a2"))))
+      .toBe("🧑 one\n\n🤖 a1\n\n---\n\n🧑 two\n\n🤖 a2");
+  });
+
+  it("an empty or all-malformed transcript yields nothing", () => {
+    expect(extractTurnAssistant("")).toBeUndefined();
+    expect(extractTurnAssistant("}\nnot json at all\n")).toBeUndefined();
+    expect(extractHistory("")).toBeUndefined();
+  });
+
+  it("content blocks without text are ignored", () => {
+    const fx = jsonl(asked("hi"), {
+      type: "assistant",
+      content: [null, "a bare string", { type: "tool_use", id: "toolu_01" }, { text: "A" }, { text: "" }, { text: "B" }],
+    });
+    expect(extractTurnAssistant(fx)).toBe("A\n\nB");
+  });
+
+  it("extractHistory returns up to five marked pairs, oldest first", () => {
+    const rows: { type: string; content: unknown }[] = [];
+    for (let i = 1; i <= 7; i++) {
+      rows.push(asked(`p${i} ${"q".repeat(600)}`), said(`a${i} ${"w".repeat(600)}`));
+    }
+    const out = extractHistory(jsonl(...rows));
+    expect(out).toBeDefined();
+    const s = out!;
+    // the five newest turns, rendered oldest first, with marks and separators
+    expect(s.split("\n\n---\n\n")).toHaveLength(5);
+    expect(s.match(/🧑/g)).toHaveLength(5);
+    expect(s.match(/🤖/g)).toHaveLength(5);
+    expect(s).not.toContain("p1");
+    expect(s).not.toContain("p2");
+    for (const t of ["p3", "p4", "p5", "p6", "p7"]) expect(s).toContain(t);
+    expect(s.indexOf("p3")).toBeLessThan(s.indexOf("p7"));
+    // each side clipped at 500 chars: 3-char tag + 496 filler + the ellipsis marker
+    expect(s).toContain("p3 " + "q".repeat(496) + "…");
+    expect(s).toContain("a7 " + "w".repeat(496) + "…");
+    expect(s).not.toContain("q".repeat(500));
+    expect(extractHistory("")).toBeUndefined();
+  });
+
+  it("a prompt with no answer is not a completed pair", () => {
+    const fx = jsonl(asked("first"), said("answer one"), asked("second, still running"));
+    expect(extractHistory(fx)).toBe("🧑 first\n\n🤖 answer one");
+  });
+
+  it("extractHistory total is clipped to MAX_TEXT_BYTES", () => {
+    const rows: { type: string; content: unknown }[] = [];
+    for (let i = 0; i < 5; i++) rows.push(asked("w".repeat(20_000)), said("v".repeat(20_000)));
+    const out = extractHistory(jsonl(...rows))!;
+    expect(Buffer.byteLength(out, "utf8")).toBeLessThanOrEqual(MAX_TEXT_BYTES);
+  });
+
+  it("summaries special-case Bash, Read, Task and fall back to JSON", () => {
+    expect(toolStartSummary("Bash", { command: "echo one", description: "Print one" })).toBe("echo one");
+    expect(toolStartSummary("Read", { file_path: "/tmp/note.txt" })).toBe("/tmp/note.txt");
+    expect(toolStartSummary("Edit", { file_path: "/tmp/a.ts", old_string: "x" })).toBe("/tmp/a.ts");
+    expect(toolStartSummary("Write", { file_path: "/tmp/b.ts", content: "hi" })).toBe("/tmp/b.ts");
+    expect(toolStartSummary("NotebookEdit", { file_path: "/tmp/c.ipynb" })).toBe("/tmp/c.ipynb");
+    expect(toolStartSummary("Agent", { description: "run echo sub", prompt: "long prompt…" })).toBe("run echo sub");
+    expect(toolStartSummary("Task", { description: "the older build's name", prompt: "long prompt…" })).toBe("the older build's name");
+    expect(toolStartSummary("Grep", { pattern: "TODO" })).toBe("TODO");
+    expect(toolStartSummary("Glob", { pattern: "src/**/*.ts" })).toBe("src/**/*.ts");
+    expect(toolStartSummary("WebSearch", { query: "hk graduate salary" })).toBe("hk graduate salary");
+    expect(toolStartSummary("Sketch", { a: 1 })).toBe('{"a":1}');
+    expect(toolStartSummary("Bash", { command: "npm test &&\ngit log" })).toBe("npm test && git log");
+    expect(toolStartSummary("Bash", { command: "l".repeat(500) })).toHaveLength(200);
+    expect(toolStartSummary("Bash", undefined)).toBe("");
+    expect(toolStartSummary("Bash", null)).toBe("");
+    // tool_end: strings fold, anything else JSONs, both clipped
+    expect(toolEndSummary({ stdout: "one", stderr: "" })).toBe('{"stdout":"one","stderr":""}');
+    expect(toolEndSummary("done\nfully")).toBe("done fully");
+    expect(toolEndSummary("z".repeat(500))).toHaveLength(300);
+    expect(toolEndSummary(undefined)).toBe("");
+    expect(toolEndSummary(null)).toBe("");
+  });
+
+  it("stripChannelWrapper unwraps only a teledesk wrapper", () => {
+    expect(stripChannelWrapper('<channel source="teledesk" message_id="9">hello there</channel>')).toBe("hello there");
+    expect(stripChannelWrapper("plain terminal prompt")).toBe("plain terminal prompt");
+    const foreign = stripChannelWrapper('<channel source="other" message_id="9">hi</channel>');
+    expect(foreign.startsWith('<channel source="other"')).toBe(true);
+  });
+
+  it("Stop classifies assistant text from a real transcript file", () => {
+    const file = join(tmp(), "turn.jsonl");
+    writeFileSync(file, jsonl(asked("go"), said("I ran it."), toolResult("ok"), said("Done.")) + "\n");
+    const l = mirrorLinesFor({ hook_event_name: "Stop", session_id: CC, transcript_path: file }, { TELEDESK_MIRROR: TOKEN });
+    expect(l.map((m) => m.line.kind)).toEqual(["assistant", "turn_end"]);
+    expect(l[0]!.line.kind === "assistant" && l[0]!.line.text).toBe("I ran it.\n\nDone.");
+  });
+
+  it("desk_on classifies a history line from a real transcript file", () => {
+    const file = join(tmp(), "hist.jsonl");
+    writeFileSync(file, jsonl(asked("one"), said("a1"), asked("two"), said("a2")) + "\n");
+    const l = mirrorLinesFor(
+      { hook_event_name: "PostToolUse", session_id: CC, tool_name: "mcp__teledesk__desk_on", transcript_path: file, tool_response: [{ type: "text", text: "Desk is on" }] },
+      { TELEDESK_MIRROR: TOKEN },
+    );
+    expect(l).toHaveLength(1);
+    expect(l[0]!.line.kind === "history" && l[0]!.line.text).toBe("🧑 one\n\n🤖 a1\n\n---\n\n🧑 two\n\n🤖 a2");
   });
 });
