@@ -1,10 +1,12 @@
-/** bin/teledesk is the entry point for the desk, and dispatches four subcommands. The code
+/** bin/teledesk is the entry point for the desk, and dispatches five subcommands. The code
  * command starts Claude Code desk-capable, so its topic can be opened with /desk. The install
  * command makes an ordinary claude invocation desk-capable and adds the /desk slash command;
  * with the --shim flag it also drops a desk-aware claude in ~/bin, which is the part that
  * reaches shells that never read the rc file. The desk-channel command is the channel server
- * Claude Code itself runs for a wrapped session, and is never run by hand. The daemon is a
- * separate entry point (src/daemon.ts). Each branch imports only what it needs. */
+ * Claude Code itself runs for a wrapped session, and is never run by hand. The mirror-hook
+ * command is the hook entrypoint Claude Code runs: hook JSON in on stdin, mirror lines to the
+ * daemon, exit 0 whatever happens. The daemon is a separate entry point (src/daemon.ts).
+ * Each branch imports only what it needs. */
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { deskPaths, ensureDataDir, migrateLegacyDataDir, REPO_ROOT } from "./paths.js";
@@ -17,8 +19,21 @@ const USAGE = `teledesk — your Claude Code sessions in Telegram topics
                                  that never read the rc file (old tmux panes, sh -c, systemd)
   teledesk uninstall             remove what install added
   teledesk desk-channel          the channel server Claude Code runs for \`code\` (not run by hand)
+  teledesk mirror-hook           the hook entrypoint Claude Code runs (not run by hand)
 
 The daemon itself runs with \`npm start\` (or the systemd unit).`;
+
+/** Everything piped in on stdin, as one string. Ends on EOF; a read error is just a short read. */
+function readStdin(): Promise<string> {
+  return new Promise((res) => {
+    let s = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (d) => { s += d; });
+    process.stdin.on("end", () => res(s));
+    process.stdin.on("close", () => res(s));
+    process.stdin.on("error", () => res(s));
+  });
+}
 
 async function code(args: string[]): Promise<number> {
   const { claudeArgs, claudeVersion, interactive, MIN_CLAUDE, olderThan, runClaude, writeDeskConfig } = await import("./desk/launcher.js");
@@ -60,6 +75,16 @@ async function main(): Promise<void> {
     ensureDataDir(p.dataDir);
     process.exitCode = await runDeskChannel(p.socket);
     return;
+  }
+  if (cmd === "mirror-hook") {
+    // The hook runner reads a non-zero exit or an escaped throw as a broken hook, so this
+    // branch wraps everything — including its own module loading — in a silent exit 0.
+    try {
+      const { runMirrorHook } = await import("./desk/mirror-hook.js");
+      // Run by hand with no pipe there is nothing to read; the hook always pipes, so just leave.
+      if (process.stdin.isTTY) process.exit(0);
+      process.exit(await runMirrorHook(await readStdin(), process.env, deskPaths().socket));
+    } catch { process.exit(0); }
   }
   console.log(USAGE);
   if (cmd && cmd !== "help" && cmd !== "--help" && cmd !== "-h") process.exitCode = 1;

@@ -1,11 +1,13 @@
 /** Tests for the mirror protocol line: the token-gated hook message, the launcher
- * that mints the token into the session's child env, and the channel hello that carries it. */
+ * that mints the token into the session's child env, the channel hello that carries it,
+ * and the mirror-hook CLI that classifies hook JSON and transports the lines. */
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { createServer, type Socket } from "node:net";
 import { spawn } from "node:child_process";
-import { ChannelMessage, decode, encode, MIRROR_TOKEN, type MirrorMessage } from "../src/desk/protocol.js";
+import { ChannelMessage, decode, encode, LineReader, MIRROR_TOKEN, type MirrorMessage } from "../src/desk/protocol.js";
+import { MIRROR_TIMEOUT_MS, mirrorLinesFor, runMirrorHook, stripChannelWrapper, type HookInput } from "../src/desk/mirror-hook.js";
 import { runClaude } from "../src/desk/launcher.js";
 import { REPO_ROOT } from "../src/paths.js";
 import { tmp, until } from "./helpers.js";
@@ -155,4 +157,149 @@ describe("channel hello token", () => {
     expect(bad.type).toBe("hello");
     expect("mirror_token" in bad).toBe(false);
   }, 60_000);
+});
+
+describe("mirror-hook transport", () => {
+  /** A fake daemon: a unix socket that counts connections and collects the decoded mirror lines. */
+  const fakeDaemon = async () => {
+    const socketPath = join(tmp(), "desk.sock");
+    const msgs: MirrorMessage[] = [];
+    const socks: Socket[] = [];
+    let conns = 0;
+    const server = createServer((sock) => {
+      conns++;
+      socks.push(sock);
+      const reader = new LineReader((line) => {
+        const m = decode(ChannelMessage, line);
+        if (m && m.type === "mirror") msgs.push(m);
+      });
+      sock.on("data", (d) => { reader.push(d); });
+      sock.on("error", () => { /* the client closing is normal */ });
+    });
+    await new Promise<void>((r) => server.listen(socketPath, () => r()));
+    return {
+      socketPath, msgs, connections: () => conns,
+      close: async () => { for (const s of socks) s.destroy(); await new Promise<void>((r) => server.close(() => r())); },
+    };
+  };
+
+  const hookEnv = () => ({ TELEDESK_MIRROR: TOKEN });
+  const hookJson = (h: Record<string, unknown>) => JSON.stringify({ session_id: CC, ...h });
+
+  it("no token, no send", async () => {
+    const d = await fakeDaemon();
+    const code = await runMirrorHook(hookJson({ hook_event_name: "UserPromptSubmit", prompt: "hello" }), {}, d.socketPath);
+    expect(code).toBe(0);
+    expect(d.connections()).toBe(0);
+    expect(d.msgs).toEqual([]);
+    await d.close();
+  });
+
+  it("malformed stdin exits 0", async () => {
+    const d = await fakeDaemon();
+    expect(await runMirrorHook("{", hookEnv(), d.socketPath)).toBe(0);
+    expect(d.connections()).toBe(0);
+    expect(d.msgs).toEqual([]);
+    await d.close();
+  });
+
+  it("unknown event exits 0 without connecting", async () => {
+    const d = await fakeDaemon();
+    expect(await runMirrorHook(hookJson({ hook_event_name: "SessionStart" }), hookEnv(), d.socketPath)).toBe(0);
+    expect(d.connections()).toBe(0);
+    expect(d.msgs).toEqual([]);
+    await d.close();
+  });
+
+  it("a prompt becomes one mirror line", async () => {
+    const d = await fakeDaemon();
+    expect(await runMirrorHook(hookJson({ hook_event_name: "UserPromptSubmit", prompt: "fix the bug" }), hookEnv(), d.socketPath)).toBe(0);
+    await until(() => d.msgs.length === 1);
+    expect(d.msgs[0]).toEqual({ type: "mirror", token: TOKEN, cc_session: CC, line: { kind: "user_prompt", text: "fix the bug" } });
+    await d.close();
+  });
+
+  it("Stop sends assistant-then-turn_end when the transcript has text", async () => {
+    const d = await fakeDaemon();
+    const code = await runMirrorHook(
+      hookJson({ hook_event_name: "Stop", transcript_path: join(tmp(), "absent.jsonl") }),
+      hookEnv(), d.socketPath, { extractTurnAssistant: () => "the answer" },
+    );
+    expect(code).toBe(0);
+    await until(() => d.msgs.length === 2);
+    expect(d.msgs).toEqual([
+      { type: "mirror", token: TOKEN, cc_session: CC, line: { kind: "assistant", text: "the answer" } },
+      { type: "mirror", token: TOKEN, cc_session: CC, line: { kind: "turn_end" } },
+    ]);
+    await d.close();
+  });
+
+  it("a dead socket still exits 0", async () => {
+    const dead = join(tmp(), "no-daemon.sock");
+    const t0 = Date.now();
+    const code = await runMirrorHook(hookJson({ hook_event_name: "UserPromptSubmit", prompt: "hello" }), hookEnv(), dead);
+    expect(code).toBe(0);
+    expect(Date.now() - t0).toBeLessThan(MIRROR_TIMEOUT_MS + 200);
+  });
+});
+
+describe("mirror-hook classification", () => {
+  const env = { TELEDESK_MIRROR: TOKEN };
+  const kinds = (lines: MirrorMessage[]) => lines.map((m) => m.line.kind);
+
+  it("needs the token and a session id", () => {
+    const h: HookInput = { hook_event_name: "UserPromptSubmit", session_id: CC, prompt: "hi" };
+    expect(mirrorLinesFor(h, {})).toEqual([]);
+    expect(mirrorLinesFor(h, { TELEDESK_MIRROR: "not-a-token" })).toEqual([]);
+    expect(mirrorLinesFor({ hook_event_name: "UserPromptSubmit", prompt: "hi" }, env)).toEqual([]);
+    expect(mirrorLinesFor({ hook_event_name: "UserPromptSubmit", session_id: "", prompt: "hi" }, env)).toEqual([]);
+  });
+
+  it("an empty prompt is nothing to send", () => {
+    expect(mirrorLinesFor({ hook_event_name: "UserPromptSubmit", session_id: CC, prompt: "   " }, env)).toEqual([]);
+  });
+
+  it("a tool call becomes start and end lines", () => {
+    const pre = mirrorLinesFor({ hook_event_name: "PreToolUse", session_id: CC, tool_name: "Bash", tool_input: { command: "echo one" } }, env);
+    expect(pre[0]).toMatchObject({ type: "mirror", token: TOKEN, cc_session: CC });
+    expect(pre[0]!.line).toMatchObject({ kind: "tool_start", tool_name: "Bash" });
+    expect(pre[0]!.line.kind === "tool_start" && pre[0]!.line.summary).toContain("echo one");
+    const post = mirrorLinesFor({ hook_event_name: "PostToolUse", session_id: CC, tool_name: "Bash", tool_response: { stdout: "one", stderr: "", interrupted: false } }, env);
+    expect(post[0]!.line).toMatchObject({ kind: "tool_end", tool_name: "Bash", ok: true });
+  });
+
+  it("a missing or error-shaped response is not ok", () => {
+    const noResp = mirrorLinesFor({ hook_event_name: "PostToolUse", session_id: CC, tool_name: "Bash" }, env);
+    expect(noResp[0]!.line).toMatchObject({ kind: "tool_end", ok: false });
+    const err = mirrorLinesFor({ hook_event_name: "PostToolUse", session_id: CC, tool_name: "Bash", tool_response: { error: "boom" } }, env);
+    expect(err[0]!.line).toMatchObject({ kind: "tool_end", ok: false });
+  });
+
+  it("internal gating tools never become bubbles", () => {
+    expect(mirrorLinesFor({ hook_event_name: "PreToolUse", session_id: CC, tool_name: "ToolSearch", tool_input: { query: "select:mcp__x__y" } }, env)).toEqual([]);
+    expect(mirrorLinesFor({ hook_event_name: "PostToolUse", session_id: CC, tool_name: "ToolSearch", tool_response: { matches: [], query: "x", total_deferred_tools: 1 } }, env)).toEqual([]);
+  });
+
+  it("the subagent tool fires as Agent", () => {
+    const l = mirrorLinesFor({ hook_event_name: "PreToolUse", session_id: CC, tool_name: "Agent", tool_input: { description: "run echo" } }, env);
+    expect(l[0]!.line).toMatchObject({ kind: "tool_start", tool_name: "Agent" });
+  });
+
+  it("desk_on asks for history, and the stub has none yet", () => {
+    // The trigger is wired; Task 6 fills extractHistory. Until then: no tool_end bubble either.
+    const l = mirrorLinesFor({ hook_event_name: "PostToolUse", session_id: CC, tool_name: "mcp__teledesk__desk_on", tool_response: [{ type: "text", text: "Desk is on" }] }, env);
+    expect(l).toEqual([]);
+  });
+
+  it("Stop with the stubbed extractor sends turn_end only", () => {
+    const l = mirrorLinesFor({ hook_event_name: "Stop", session_id: CC, transcript_path: join(tmp(), "absent.jsonl") }, env);
+    expect(kinds(l)).toEqual(["turn_end"]);
+  });
+
+  it("stripChannelWrapper unwraps a phone message and leaves others alone", () => {
+    expect(stripChannelWrapper('<channel source="teledesk" message_id="42">ping</channel>')).toBe("ping");
+    expect(stripChannelWrapper('<channel source="teledesk" message_id="42">\nlong text\n</channel>')).toBe("long text");
+    const plain = "terminal-typed prompt";
+    expect(stripChannelWrapper(plain)).toBe(plain);
+  });
 });
