@@ -1,15 +1,17 @@
 /** The daemon side of desk sessions. Each Claude Code session's channel server
  * connects to a unix socket here; the router gives it a forum topic in the owner's
  * desk group and relays: owner's messages in the topic → that session, its replies
- * and permission prompts → that topic. Only text the owner wrote ever reaches a
+ * and permission prompts → that topic, and (mirrored) what the session's hooks report
+ * of the terminal-side chat → that topic too. Only text the owner wrote ever reaches a
  * session: gated on the sender's user id, and forwards, inline-bot messages and
  * posts made as a chat are dropped. Depends only on ./types.ts interfaces. */
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { chmodSync, lstatSync, statSync, unlinkSync } from "node:fs";
 import { dirname } from "node:path";
 import { createHash } from "node:crypto";
-import { ChannelMessage, clip, decode, encode, LineReader, oneLine, VERDICT_TEXT, type DaemonMessage } from "./protocol.js";
+import { ChannelMessage, clip, decode, encode, LineReader, oneLine, VERDICT_TEXT, type DaemonMessage, type MirrorMessage } from "./protocol.js";
 import { CHUNK, cleanText, INVISIBLE, promptMessages, tooLongText } from "./prompt.js";
+import { stripChannelWrapper } from "./mirror-hook.js";
 import type { DeskLog, DeskSessionRow, DeskState, DeskTelegram, DeskUpdate } from "./types.js";
 
 export const NO_SESSION_TEXT = "No Claude Code session is open for this folder. Start one with `teledesk code` there.";
@@ -35,6 +37,18 @@ const BACKLOG_RESUME = 2;
 /** Every part of a Claude reply starts with this, and nothing the router writes ever does: the
  * owner can always tell Claude's words from the router's own messages and prompts. */
 export const REPLY_MARK = "🤖 ";
+/** Prompts the session's hooks report (and the terminal user typed) start with this. */
+export const MIRROR_MARK = "🧑 ";
+/** The snapshot of recent chat posted when a desk opens. */
+export const HISTORY_MARK = "📜 ";
+/** How often one session's chat snapshot may be posted. */
+export const HISTORY_COOLDOWN_MS = 120_000;
+
+/** An open run of tool calls, shown as one updating message (Task 8 fills in the edits). */
+export interface MirrorBatch { toolName: string; messageId: number; starts: number; ends: number; lastSummary: string; lastOk: boolean; }
+/** Per-session mirror state: what the phone said, what was sent recently, the open batch. */
+interface MirrorSession { batch?: MirrorBatch; gateOpen: boolean; sent: number[]; lastInjected?: string; lastHistoryAt: number; }
+
 /** Fail-closed limits: what one local process or one runaway session can make the router do. */
 export interface DeskLimits {
   /** Live sessions with a topic, all together. */
@@ -45,6 +59,8 @@ export interface DeskLimits {
   topicsPerMinute: number;
   /** Messages one session may post per minute; more wait their turn. */
   sendsPerMinute: number;
+  /** Mirror lines one session may post per minute. Chat waits its turn; tool lines drop. */
+  mirrorSendsPerMinute: number;
   /** How long part of a line may wait for the rest (while the router is reading). */
   partialLineMs: number;
   /** How often sessions waiting for a topic are tried again. */
@@ -52,7 +68,7 @@ export interface DeskLimits {
   /** Group updates waiting to be handled; past this, new ones are dropped. */
   queuedUpdates: number;
 }
-export const DEFAULT_LIMITS: DeskLimits = { sessions: 20, startsPerMinute: 10, topicsPerMinute: 5, sendsPerMinute: 20, partialLineMs: 30_000, retryWaitingMs: 20_000, queuedUpdates: 500 };
+export const DEFAULT_LIMITS: DeskLimits = { sessions: 20, startsPerMinute: 10, topicsPerMinute: 5, sendsPerMinute: 20, mirrorSendsPerMinute: 60, partialLineMs: 30_000, retryWaitingMs: 20_000, queuedUpdates: 500 };
 /** Size bound for the sets and maps that remember senders, chats and notices. */
 const MEMORY_KEEP = 1000;
 /** Control characters (newlines and tabs stay), direction overrides and invisible characters
@@ -175,6 +191,14 @@ export class DeskRouter {
   private topicsMade: number[] = [];
   private retryTimer?: NodeJS.Timeout;
   private limitLogAt = new Map<string, number>();
+  /** Mirror token → the row that hello'd it in (set in bind(), cleared in endSession). Registered
+   * only after desk_on, so unknown tokens from desk-capable sessions are an everyday drop. */
+  private mirrorRows = new Map<string, number>();
+  /** Mirror token → the first cc_session seen on its lines: later ones must match it. */
+  private mirrorCc = new Map<string, string>();
+  private mirrorState = new Map<number, MirrorSession>();
+  /** Dropped mirror lines log once per reason (never per line, never with the token's value). */
+  private loggedMirrors = new Set<string>();
   private lim: DeskLimits;
   private tg: DeskTelegram;
   private state: DeskState;
@@ -377,6 +401,9 @@ export class DeskRouter {
       conn.sock.end();
       return;
     }
+    // Mirror lines come from short-lived hook connections that never said hello, so they
+    // dispatch by token before anything looks for a topic on this connection.
+    if (m.type === "mirror") { await this.mirrorLine(m); return; }
     const row = this.topicOf(conn);
     if (!row) { this.write(conn, { type: "error", reason: this.state.group() ? "This session has no topic yet." : NO_GROUP_REASON }); return; }
     if (m.type === "reply") {
@@ -385,8 +412,6 @@ export class DeskRouter {
       if (failed) await this.post(row.group_id, row.topic_id, `⚠️ ${failed} part(s) of that reply didn't send.`);
       return;
     }
-    // Anything that wasn't hello/bye/reply used to be a permission prompt; mirror is new
-    // and the router ignores it until it learns to mirror.
     if (m.type === "permission_request") await this.prompt(conn, row, m);
   }
 
@@ -423,6 +448,82 @@ export class DeskRouter {
     const group = this.state.group();
     if (!row || !group || row.group_id !== group || row.topic_id === null) return undefined;
     return row as DeskSessionRow & { group_id: string; topic_id: number };
+  }
+
+  // ---- mirror lines (what the session's hooks report about the terminal-side chat) ----
+
+  /** The row's mirror state, created on first use. */
+  private mirrorSession(rowId: number): MirrorSession {
+    let st = this.mirrorState.get(rowId);
+    if (!st) { st = { gateOpen: false, sent: [], lastHistoryAt: 0 }; this.mirrorState.set(rowId, st); }
+    return st;
+  }
+
+  /** Room in this session's mirror send window? Chat that's over budget waits ~500 ms and is
+   * posted anyway — a mirror line is never dropped for pacing (droppable: tool lines, Task 8's
+   * callers, are skipped instead). Resolves true = post, false = skip. */
+  private async mirrorPace(rowId: number, droppable: boolean): Promise<boolean> {
+    const st = this.mirrorSession(rowId);
+    if (this.take(st.sent, this.lim.mirrorSendsPerMinute)) return true;
+    if (droppable) return false;
+    await new Promise((r) => setTimeout(r, 500));
+    this.take(st.sent, this.lim.mirrorSendsPerMinute);
+    return true;
+  }
+
+  /** Close the session's open tool batch. A no-op beyond clearing the reference until Task 8
+   * replaces this body with the batch message's final edit (no Telegram call today). */
+  private async closeBatch(rowId: number): Promise<void> {
+    const st = this.mirrorState.get(rowId);
+    if (st) st.batch = undefined;
+  }
+
+  /** One hook-reported line: gated by token, bound to one Claude Code session, then posted
+   * (chat kinds) or handed to Task 8 (tool kinds). Drops are silent — sessions whose desk is
+   * off mirror all day against tokens that were never registered. */
+  private async mirrorLine(m: MirrorMessage): Promise<void> {
+    const rowId = this.mirrorRows.get(m.token);
+    if (rowId === undefined) { this.logOnce(this.loggedMirrors, "unknown-token", "desk: dropped a mirror line from an unknown token"); return; }
+    const row = this.state.get(rowId);
+    if (!row || row.status !== "live" || !row.group_id || row.topic_id === null) { this.logOnce(this.loggedMirrors, `no-topic:${rowId}`, `desk: dropped a mirror line for session ${rowId}: no live topic`); return; }
+    // First cc_session seen on this token owns it; anything else is another session's line.
+    const bound = this.mirrorCc.get(m.token);
+    if (bound === undefined) this.mirrorCc.set(m.token, m.cc_session);
+    else if (bound !== m.cc_session) { this.logOnce(this.loggedMirrors, `cc:${rowId}`, `desk: dropped a mirror line for session ${rowId}: a different Claude Code session`); return; }
+    const st = this.mirrorSession(rowId);
+    const line = m.line;
+    switch (line.kind) {
+      case "user_prompt": {
+        // A prompt that arrived on the phone isn't terminal news: don't echo the owner's own words.
+        const text = stripChannelWrapper(line.text);
+        if (text === st.lastInjected) return;
+        st.gateOpen = true;
+        await this.post(row.group_id, row.topic_id, replyText(text), { shape: (p) => MIRROR_MARK + p, before: async () => { await this.mirrorPace(rowId, false); } });
+        return;
+      }
+      case "assistant": {
+        st.gateOpen = true;
+        await this.post(row.group_id, row.topic_id, replyText(line.text), { shape: (p) => REPLY_MARK + p, before: async () => { await this.mirrorPace(rowId, false); } });
+        return;
+      }
+      case "history": {
+        const now = Date.now();
+        if (now - st.lastHistoryAt >= HISTORY_COOLDOWN_MS) {
+          st.lastHistoryAt = now;
+          await this.post(row.group_id, row.topic_id, HISTORY_MARK + "Recent chat:\n\n" + line.text);
+        }
+        return;
+      }
+      case "turn_end": {
+        st.gateOpen = false;
+        await this.closeBatch(rowId);
+        return;
+      }
+      case "tool_start":
+      case "tool_end":
+        // Tool batches are Task 8: no-op arms until then.
+        return;
+    }
   }
 
   /** Give a connected session its topic: the same one again after a daemon restart, the
@@ -493,6 +594,8 @@ export class DeskRouter {
     }
     conn.sessionId = id;
     this.bySession.set(id, conn);
+    // The mirror link goes live with the topic: this token's lines belong to this row.
+    if (conn.hello?.mirror_token) this.mirrorRows.set(conn.hello.mirror_token, id);
     const t = this.graceTimers.get(id);
     if (t) { clearTimeout(t); this.graceTimers.delete(id); }
   }
@@ -508,6 +611,11 @@ export class DeskRouter {
     const id = conn.sessionId;
     if (id === undefined) return;
     if (this.bySession.get(id) === conn) this.bySession.delete(id);
+    // The mirror link dies with the session: the token maps to no row any more, so lines from
+    // anything still holding it drop as unknown, and a later /desk re-registers cleanly.
+    const token = conn.hello?.mirror_token;
+    if (token !== undefined && this.mirrorRows.get(token) === id) { this.mirrorRows.delete(token); this.mirrorCc.delete(token); }
+    this.mirrorState.delete(id);
     if (hide) await this.hideRowTopic(id, conn.hello?.pid);
     await this.setRowOffline(id, conn.hello?.pid);
   }
@@ -681,6 +789,9 @@ export class DeskRouter {
     if (u.date !== undefined && u.date * 1000 < started - CLOCK_SLACK_MS) { await this.post(chat, thread, BEFORE_SESSION); return; }
     const v = VERDICT_TEXT.exec(text);
     if (v) { await this.verdict(row.id, v[2].toLowerCase(), v[1].toLowerCase().startsWith("y"), { threadId: thread }); return; }
+    // Record it before the write: if UserPromptSubmit echoes this text back as a mirror line,
+    // the echo's connection may be served before this one finishes.
+    this.mirrorSession(row.id).lastInjected = text;
     this.write(conn, { type: "message", text, message_id: u.messageId });
     void this.tg.typing(chat, thread).catch(() => undefined);
   }

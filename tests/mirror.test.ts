@@ -1,19 +1,22 @@
 /** Tests for the mirror protocol line: the token-gated hook message, the launcher
  * that mints the token into the session's child env, the channel hello that carries it,
  * and the mirror-hook CLI that classifies hook JSON and transports the lines. */
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { createServer, type Socket } from "node:net";
+import { createConnection, createServer, type Socket } from "node:net";
 import { spawn } from "node:child_process";
-import { ChannelMessage, decode, encode, LineReader, MAX_TEXT_BYTES, MIRROR_TOKEN, type MirrorMessage } from "../src/desk/protocol.js";
+import { DatabaseSync } from "node:sqlite";
+import { ChannelMessage, DaemonMessage, decode, encode, LineReader, MAX_TEXT_BYTES, MIRROR_TOKEN, type MirrorMessage } from "../src/desk/protocol.js";
 import {
   extractHistory, extractTurnAssistant, MIRROR_TIMEOUT_MS, mirrorLinesFor, runMirrorHook,
   stripChannelWrapper, toolEndSummary, toolStartSummary, type HookInput,
 } from "../src/desk/mirror-hook.js";
 import { runClaude } from "../src/desk/launcher.js";
+import { DeskRouter, REPLY_MARK, type DeskLimits } from "../src/desk/router.js";
+import { SqliteDeskState } from "../src/desk/state.js";
 import { REPO_ROOT } from "../src/paths.js";
-import { tmp, until } from "./helpers.js";
+import { FakeTelegram, G, GROUP, OWNER, tmp, until } from "./helpers.js";
 
 const TOKEN = "0123456789abcdef0123456789abcdef";
 const CC = "3f9a1c2b-0d4e-4a7b-8c5d-1e2f3a4b5c6d";
@@ -447,5 +450,150 @@ describe("transcript extraction", () => {
     );
     expect(l).toHaveLength(1);
     expect(l[0]!.line.kind === "history" && l[0]!.line.text).toBe("🧑 one\n\n🤖 a1\n\n---\n\n🧑 two\n\n🤖 a2");
+  });
+});
+
+// ---- daemon: the chat mirror ----
+
+const cleanups: (() => Promise<void> | void)[] = [];
+afterEach(async () => { for (const c of cleanups.splice(0).reverse()) await c(); });
+
+/** The session's persistent channel connection (hello → welcome), as `desk.test.ts` fakes it. */
+class DeskChannel {
+  got: DaemonMessage[] = [];
+  constructor(readonly sock: Socket) {
+    const r = new LineReader((l) => { const m = decode(DaemonMessage, l); if (m) this.got.push(m); });
+    sock.on("data", (d) => r.push(d));
+    sock.on("error", () => { /* the daemon closing is normal */ });
+  }
+  static connect(path: string): Promise<DeskChannel> {
+    return new Promise((resolve, reject) => { const s = createConnection(path, () => resolve(new DeskChannel(s))); s.once("error", reject); });
+  }
+  send(m: ChannelMessage | object) { this.sock.write(encode(m as ChannelMessage)); }
+  async wait(type: DaemonMessage["type"]) { await until(() => this.got.some((m) => m.type === type)); }
+}
+
+/** One mirror line the way a hook CLI delivers it: a short-lived connection, write one line,
+ * hold it open briefly, then close. Resolves to everything the daemon wrote back ("" when the
+ * line was accepted and silently handled or dropped). */
+function mirrorSocket(path: string, m: ChannelMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const s = createConnection(path, () => { s.write(encode(m)); });
+    let got = "";
+    s.on("data", (d) => { got += d.toString("utf8"); });
+    s.on("error", (e) => reject(e));
+    s.on("close", () => resolve(got));
+    setTimeout(() => s.destroy(), 250);
+  });
+}
+
+let msgId = 1000;
+const say = (text: string, thread: number | undefined) =>
+  ({ kind: "message" as const, chatId: GROUP, chatType: "supergroup", fromId: OWNER, messageId: msgId++, threadId: thread, isTopic: thread !== undefined, text });
+
+/** Generous limits for tests about other things, exactly as `desk.test.ts` sets them. */
+const ROOMY: Partial<DeskLimits> = { sendsPerMinute: 100_000, startsPerMinute: 100_000, topicsPerMinute: 100_000 };
+
+async function deskSetup(limits?: Partial<DeskLimits>) {
+  const dir = tmp();
+  const tg = new FakeTelegram();
+  const meta = new Map<string, string>();
+  const state = new SqliteDeskState(new DatabaseSync(":memory:"), { get: (k) => meta.get(k), set: (k, v) => { meta.set(k, v); }, delete: (k) => { meta.delete(k); } });
+  state.setGroup(G);
+  const logs: string[] = [];
+  const socketPath = join(dir, "desk.sock");
+  const router = new DeskRouter({ socketPath, ownerId: String(OWNER), telegram: tg, state, log: (m) => logs.push(m), alive: () => true, limits: { ...ROOMY, ...limits } });
+  await router.start();
+  cleanups.push(() => router.stop());
+  /** A desk session whose hello carries a mirror token: attached, welcomed, with a topic. */
+  const open = async (cwd: string, pid: number, token: string) => {
+    const c = await DeskChannel.connect(socketPath);
+    cleanups.push(() => { c.sock.destroy(); });
+    c.send({ type: "hello", cwd, pid, title: cwd.split("/").pop(), mirror_token: token });
+    await c.wait("welcome");
+    const w = c.got.find((m) => m.type === "welcome")!;
+    return { c, topic: state.get(w.session_id)!.topic_id!, sid: w.session_id };
+  };
+  return { tg, state, logs, router, socketPath, open };
+}
+
+describe("daemon chat mirror", () => {
+  it("a prompt line posts with the mirror mark", async () => {
+    const { tg, socketPath, open } = await deskSetup();
+    const d = await open("/w/proj", 11, TOKEN);
+    await mirrorSocket(socketPath, mirror({ kind: "user_prompt", text: "hello" }));
+    expect(tg.inTopic(d.topic)).toEqual([expect.stringMatching(/Session started/), "🧑 hello"]);
+  });
+
+  it("phone-injected text does not echo", async () => {
+    const { tg, router, socketPath, open } = await deskSetup();
+    const d = await open("/w/proj", 11, TOKEN);
+    await router.onUpdate(say("hello", d.topic));
+    await d.c.wait("message");
+    const n = tg.sent.length;
+    await mirrorSocket(socketPath, mirror({ kind: "user_prompt", text: '<channel source="teledesk" message_id="1">hello</channel>' }));
+    expect(tg.sent.length).toBe(n);
+  });
+
+  it("an assistant line posts with the reply mark, chunked", async () => {
+    const { tg, socketPath, open } = await deskSetup();
+    const d = await open("/w/proj", 11, TOKEN);
+    const long = "alpha bravo charlie ".repeat(300); // 6000 chars: past one CHUNK
+    await mirrorSocket(socketPath, mirror({ kind: "assistant", text: long }));
+    await until(() => tg.inTopic(d.topic).filter((t) => t.startsWith(REPLY_MARK)).length >= 2);
+    const parts = tg.inTopic(d.topic).slice(1);
+    expect(parts.every((t) => t.startsWith(REPLY_MARK))).toBe(true);
+    expect(parts.map((t) => t.slice(REPLY_MARK.length)).join("")).toBe(long);
+  });
+
+  it("mirror lines with a foreign cc_session are dropped", async () => {
+    const { tg, socketPath, open } = await deskSetup();
+    const d = await open("/w/proj", 11, TOKEN);
+    await mirrorSocket(socketPath, mirror({ kind: "user_prompt", text: "first" }));
+    await until(() => tg.inTopic(d.topic).some((t) => t === "🧑 first"));
+    const n = tg.sent.length;
+    await mirrorSocket(socketPath, { ...mirror({ kind: "user_prompt", text: "second" }), cc_session: "9d2e8f1a-5b3c-4d6e-9a0f-2c7e8b1d4f30" });
+    expect(tg.sent.length).toBe(n);
+  });
+
+  it("an unknown token is dropped silently", async () => {
+    const { tg, logs, socketPath, open } = await deskSetup();
+    const d = await open("/w/proj", 11, TOKEN);
+    const n = tg.sent.length;
+    const stranger = "ffffffffffffffffffffffffffffffff";
+    const got = await mirrorSocket(socketPath, { ...mirror({ kind: "user_prompt", text: "sneaky" }), token: stranger });
+    expect(got).toBe(""); // the hook connection isn't errored
+    expect(tg.sent.length).toBe(n); // nothing posted
+    const allLogs = logs.join("\n");
+    expect(allLogs).not.toContain(stranger); // the token's value never reaches the log
+    expect(allLogs).not.toContain(TOKEN);
+    expect(allLogs).not.toContain("sneaky");
+  });
+
+  it("history posts once inside the cooldown", async () => {
+    const { tg, socketPath, open } = await deskSetup();
+    const d = await open("/w/proj", 11, TOKEN);
+    await mirrorSocket(socketPath, mirror({ kind: "history", text: "the earlier chat" }));
+    await until(() => tg.inTopic(d.topic).some((t) => t.startsWith("📜 ")));
+    await mirrorSocket(socketPath, mirror({ kind: "history", text: "and again" }));
+    expect(tg.inTopic(d.topic).filter((t) => t.startsWith("📜 ")).length).toBe(1);
+    expect(tg.inTopic(d.topic)[1]).toBe("📜 Recent chat:\n\nthe earlier chat");
+  });
+
+  it("over budget, chat waits but never drops", async () => {
+    const { tg, socketPath, open } = await deskSetup({ mirrorSendsPerMinute: 2 });
+    const d = await open("/w/proj", 11, TOKEN);
+    for (const p of ["one", "two", "three"]) await mirrorSocket(socketPath, mirror({ kind: "user_prompt", text: p }));
+    await until(() => ["🧑 one", "🧑 two", "🧑 three"].every((m) => tg.inTopic(d.topic).includes(m)));
+  });
+
+  it("endSession clears the token mapping", async () => {
+    const { tg, state, socketPath, open } = await deskSetup();
+    const d = await open("/w/proj", 11, TOKEN);
+    d.c.send({ type: "bye" });
+    await until(() => state.get(d.sid)!.status === "offline");
+    const got = await mirrorSocket(socketPath, mirror({ kind: "user_prompt", text: "after the end" }));
+    expect(got).toBe("");
+    expect(tg.inTopic(d.topic).filter((t) => t.startsWith("🧑 ")).length).toBe(0);
   });
 });
