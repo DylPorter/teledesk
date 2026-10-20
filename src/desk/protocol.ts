@@ -32,7 +32,9 @@ export const MirrorLine = z.discriminatedUnion("kind", [
 
 export const ChannelMessage = z.discriminatedUnion("type", [
   z.object({ type: z.literal("hello"), cwd: z.string().min(1).max(4096), pid: z.number().int().positive(), title: short(256), branch: short(256).optional(), mirror_token: z.string().regex(MIRROR_TOKEN).optional() }).strict(),
-  z.object({ type: z.literal("reply"), text: text().refine((s) => s.trim().length > 0, "empty") }).strict(),
+  // There is deliberately no `reply` variant: the model can't post to the topic. What the phone
+  // sees comes from the hooks as `mirror` lines. A pre-upgrade channel still sending `reply` fails
+  // to decode here — the router's reader answers that line with an error and the connection lives.
   // mirror: one hook-reported line, gated by the session's token and bound to its Claude Code session.
   z.object({ type: z.literal("mirror"), token: z.string().regex(MIRROR_TOKEN), cc_session: z.string().min(1).max(64), line: MirrorLine }).strict(),
   // too_long: the request was too big to send whole; it's shown as answer-in-the-terminal only.

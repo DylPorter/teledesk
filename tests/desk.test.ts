@@ -47,6 +47,11 @@ const tap = (data: string, messageId: number, text?: string, from = OWNER): Desk
 const cleanups: (() => Promise<void> | void)[] = [];
 afterEach(async () => { for (const c of cleanups.splice(0).reverse()) await c(); });
 
+// Synthetic mirror tokens and a mirror assistant line, for routing tests on the surviving path.
+const TOKA = "0123456789abcdef0123456789abcdef";
+const TOKB = "fedcba9876543210fedcba9876543210";
+const mirrored = (token: string, cc: string, text: string) => ({ type: "mirror", token, cc_session: cc, line: { kind: "assistant", text } });
+
 function memState(db = new DatabaseSync(":memory:")) {
   const meta = new Map<string, string>();
   const state = new SqliteDeskState(db, { get: (k) => meta.get(k), set: (k, v) => { meta.set(k, v); }, delete: (k) => { meta.delete(k); } });
@@ -68,10 +73,10 @@ async function setup(o: { group?: boolean; alive?: (pid: number) => boolean; gra
   let stopped = false;
   const stop = async () => { if (!stopped) { stopped = true; await router.stop(); } };
   cleanups.push(stop);
-  const open = async (cwd: string, pid: number, branch?: string) => {
+  const open = async (cwd: string, pid: number, branch?: string, mirrorToken?: string) => {
     const c = await FakeChannel.connect(socketPath);
     cleanups.push(() => { c.sock.destroy(); });
-    c.send({ type: "hello", cwd, pid, title: cwd.split("/").pop(), ...(branch ? { branch } : {}) });
+    c.send({ type: "hello", cwd, pid, title: cwd.split("/").pop(), ...(branch ? { branch } : {}), ...(mirrorToken ? { mirror_token: mirrorToken } : {}) });
     const w = await c.wait("welcome");
     const row = state.get(w.session_id)!;
     return { c, w, topic: row.topic_id!, sid: w.session_id };
@@ -83,19 +88,19 @@ describe("desk protocol", () => {
   it("accepts well-formed messages and rejects everything else", () => {
     const ok = (m: unknown) => decode(ChannelMessage, JSON.stringify(m)) !== undefined;
     expect(ok({ type: "hello", cwd: "/w/proj", pid: 12, title: "proj", branch: "main" })).toBe(true);
-    expect(ok({ type: "reply", text: "hi" })).toBe(true);
     expect(ok({ type: "permission_request", request_id: "abcde", tool_name: "Bash", description: "d", input_preview: "{}" })).toBe(true);
     expect(ok({ type: "bye" })).toBe(true);
     expect(ok({ type: "bye", hide: true })).toBe(true);
     expect(ok({ type: "bye", hide: "yes" })).toBe(false);
     expect(ok({ type: "permission_request", request_id: "abcdl", tool_name: "Bash", description: "d", input_preview: "" })).toBe(false); // no 'l'
     expect(ok({ type: "permission_request", request_id: "ABCDE", tool_name: "Bash", description: "d", input_preview: "" })).toBe(false);
-    expect(ok({ type: "reply", text: "x".repeat(MAX_TEXT_BYTES + 1) })).toBe(false);
-    expect(ok({ type: "reply", text: "é".repeat(MAX_TEXT_BYTES / 2 + 1) })).toBe(false); // counted in bytes
-    expect(ok({ type: "reply", text: "   " })).toBe(false);
+    // the reply variant died with the mirror: a pre-upgrade channel's line no longer decodes
+    expect(ok({ type: "reply", text: "hi" })).toBe(false);
+    expect(ok({ type: "permission_request", request_id: "abcde", tool_name: "Bash", description: "x".repeat(MAX_TEXT_BYTES + 1), input_preview: "" })).toBe(false);
+    expect(ok({ type: "permission_request", request_id: "abcde", tool_name: "Bash", description: "é".repeat(MAX_TEXT_BYTES / 2 + 1), input_preview: "" })).toBe(false); // counted in bytes
     expect(ok({ type: "hello", cwd: "", pid: 1, title: "x" })).toBe(false);
     expect(ok({ type: "hello", cwd: "/x", pid: -1, title: "x" })).toBe(false);
-    expect(ok({ type: "reply", text: "hi", extra: 1 })).toBe(false);
+    expect(ok({ type: "permission_request", request_id: "abcde", tool_name: "Bash", description: "d", input_preview: "{}", extra: 1 })).toBe(false);
     expect(ok({ type: "shell", cmd: "rm" })).toBe(false);
     expect(decode(ChannelMessage, "not json")).toBeUndefined();
     expect(decode(DaemonMessage, JSON.stringify({ type: "verdict", request_id: "abcde", behavior: "maybe" }))).toBeUndefined();
@@ -122,10 +127,10 @@ describe("desk router: topics and routing", () => {
     expect(tg.inTopic(topic)[0]).toMatch(/^▶️ Session started\n\/w\/proj \(main\)$/);
   });
 
-  it("two sessions in two folders: each topic reaches only its own session, each reply lands only in its own topic", async () => {
+  it("two sessions in two folders: each topic reaches only its own session, each mirrored answer lands only in its own topic", async () => {
     const { tg, router, open } = await setup();
-    const a = await open("/w/alpha", 11);
-    const b = await open("/w/beta", 12);
+    const a = await open("/w/alpha", 11, undefined, TOKA);
+    const b = await open("/w/beta", 12, undefined, TOKB);
     expect(a.topic).not.toBe(b.topic);
     await router.onUpdate(say("hello alpha", a.topic));
     await router.onUpdate(say("hello beta", b.topic));
@@ -135,9 +140,9 @@ describe("desk router: topics and routing", () => {
     expect(a.c.of("message").map((m) => m.text)).toEqual(["hello alpha"]);
     expect(b.c.of("message").map((m) => m.text)).toEqual(["hello beta"]);
     expect(tg.typingIn).toEqual([a.topic, b.topic]);
-    b.c.send({ type: "reply", text: "from beta" });
-    a.c.send({ type: "reply", text: "from alpha" });
-    await until(() => tg.sent.length >= 4);
+    b.c.send(mirrored(TOKB, "cc-beta", "from beta"));
+    a.c.send(mirrored(TOKA, "cc-alpha", "from alpha"));
+    await until(() => tg.inTopic(a.topic).includes("🤖 from alpha") && tg.inTopic(b.topic).includes("🤖 from beta"));
     expect(tg.inTopic(a.topic)).toEqual([expect.stringMatching(/Session started/), "🤖 from alpha"]);
     expect(tg.inTopic(b.topic)).toEqual([expect.stringMatching(/Session started/), "🤖 from beta"]);
   });
@@ -212,7 +217,7 @@ describe("desk router: topics and routing", () => {
     cleanups.push(() => { c.sock.destroy(); });
     c.send({ type: "hello", cwd: "/w/proj", pid: 11, title: "proj" });
     expect((await c.wait("error")).reason).toBe(NO_GROUP_REASON);
-    c.send({ type: "reply", text: "anyone?" });
+    c.send({ type: "reply", text: "anyone?" }); // a pre-upgrade channel's stale line: answered with an error, nothing posted
     await c.wait("error", 2);
     expect(tg.sent).toEqual([]);
   });
@@ -240,14 +245,14 @@ describe("desk router: connection limits", () => {
     await until(() => c.closed);
   });
 
-  it("a burst of replies against a slow Telegram all arrive, in order", async () => {
+  it("a burst of prompts against a slow Telegram all arrive, in order", async () => {
     const { tg, open } = await setup();
     const s = await open("/w/proj", 11);
     const send = tg.send.bind(tg);
     tg.send = async (...a: Parameters<FakeTelegram["send"]>) => { await new Promise((r) => setTimeout(r, 1)); return send(...a); };
-    for (let i = 0; i < 60; i++) s.c.send({ type: "reply", text: `r${i}` });
+    for (let i = 0; i < 60; i++) s.c.send({ type: "permission_request", request_id: "abcde", tool_name: `Bash${i}`, description: "", input_preview: "", too_long: true });
     await until(() => tg.inTopic(s.topic).length === 61, 5000);
-    expect(tg.inTopic(s.topic).slice(1)).toEqual(Array.from({ length: 60 }, (_, i) => `🤖 r${i}`));
+    expect(tg.inTopic(s.topic).slice(1)).toEqual(Array.from({ length: 60 }, (_, i) => tooLongText(`Bash${i}`)));
   });
 
   it("won't listen in a folder other users can write to", async () => {
@@ -270,7 +275,7 @@ describe("desk router: connection limits", () => {
 });
 
 describe("desk router: gating", () => {
-  it("a stranger's message in a session's topic never reaches the session, gets no reply there, and turns desk off (they can read it)", async () => {
+  it("a stranger's message in a session's topic never reaches the session, gets no answer there, and turns desk off (they can read it)", async () => {
     const { tg, router, logs, state, open } = await setup();
     const s = await open("/w/proj", 11);
     await router.onUpdate(say("run rm -rf ~", s.topic, STRANGER));
@@ -278,7 +283,7 @@ describe("desk router: gating", () => {
     await router.onUpdate({ kind: "message", chatId: GROUP, chatType: "supergroup", messageId: 5, threadId: s.topic, isTopic: true, text: "anon admin" });
     await settle();
     expect(s.c.of("message")).toEqual([]);
-    expect(tg.inTopic(s.topic)).toHaveLength(1); // only "Session started": no reply to strangers
+    expect(tg.inTopic(s.topic)).toHaveLength(1); // only "Session started": no answer to strangers
     expect(logs.filter((l) => l.startsWith("desk: ignored") && l.includes(String(STRANGER)))).toHaveLength(1);
     expect(state.group()).toBeUndefined();
     expect(tg.sent.filter((m) => m.text === PRIVACY_OFF).map((m) => m.thread)).toEqual([undefined]); // once, in General
@@ -341,8 +346,8 @@ describe("desk router: gating", () => {
 
   it("bot echoes don't turn the desk off; a human stranger's message still does", async () => {
     const { router, state, tg } = await setup();
-    // The session's own reply echoing back from its topic: from = the bot itself.
-    await router.onUpdate({ kind: "message", chatId: GROUP, chatType: "supergroup", fromId: 999, messageId: msgId++, isTopic: true, threadId: 5, text: "🤖 a reply", fromIsBot: true });
+    // The session's own mirrored output echoing back from its topic: from = the bot itself.
+    await router.onUpdate({ kind: "message", chatId: GROUP, chatType: "supergroup", fromId: 999, messageId: msgId++, isTopic: true, threadId: 5, text: "🤖 mirrored text", fromIsBot: true });
     // A post "as the group" (anonymous admin): from = GroupAnonymousBot, sender_chat set.
     await router.onUpdate({ kind: "message", chatId: GROUP, chatType: "supergroup", fromId: 1087968824, messageId: msgId++, text: "as the group", fromIsBot: true, senderChat: true });
     await settle();
@@ -570,25 +575,16 @@ describe("desk router: permission prompts", () => {
   });
 });
 
-describe("desk router: long replies and failures", () => {
-  it("chunks long replies under Telegram's limit", async () => {
-    const { tg, open } = await setup();
-    const s = await open("/w/proj", 11);
-    const long = Array.from({ length: 300 }, (_, i) => `line ${i} ${"x".repeat(40)}`).join("\n");
-    s.c.send({ type: "reply", text: long });
-    await until(() => tg.inTopic(s.topic).length >= 4);
-    const parts = tg.inTopic(s.topic).slice(1);
-    expect(parts.every((p) => p.length <= 4096 && p.startsWith(REPLY_MARK))).toBe(true);
-    expect(parts.map((p) => p.slice(REPLY_MARK.length)).join("\n")).toBe(long);
-  });
-
+describe("desk router: send failures", () => {
+  // Long-text chunking is tested on the surviving path: "an assistant line posts with the
+  // reply mark, chunked" in `tests/mirror.test.ts`.
   it("a failed send doesn't crash the router or lose the next message", async () => {
     const { tg, router, logs, open } = await setup();
     const s = await open("/w/proj", 11);
-    tg.failSend = (t) => t === "🤖 first";
-    s.c.send({ type: "reply", text: "first" });
-    s.c.send({ type: "reply", text: "second" });
-    await until(() => tg.inTopic(s.topic).includes("🤖 second"));
+    tg.failSend = (t) => t === tooLongText("BashA");
+    s.c.send({ type: "permission_request", request_id: "abcde", tool_name: "BashA", description: "", input_preview: "", too_long: true });
+    s.c.send({ type: "permission_request", request_id: "abcde", tool_name: "BashB", description: "", input_preview: "", too_long: true });
+    await until(() => tg.inTopic(s.topic).includes(tooLongText("BashB")));
     expect(logs.some((l) => /send failed/.test(l))).toBe(true);
     await router.onUpdate(say("still there?", s.topic));
     expect((await s.c.wait("message")).text).toBe("still there?");
@@ -727,30 +723,26 @@ describe("desk channel server", () => {
     await client.connect(clientT);
     await until(() => t.state.findLive(cwd, pid) !== undefined && ch.link.welcomed);
     const topic = t.state.findLive(cwd, pid)!.topic_id!;
-    const reply = async (text: string) => ((await client.callTool({ name: "reply", arguments: { text } })) as { content: { text: string }[]; isError?: boolean });
     const permission = (request_id: string) => (client as unknown as { notification(n: unknown): Promise<void> }).notification({
       method: "notifications/claude/channel/permission_request", params: { request_id, tool_name: "Bash", description: "List files", input_preview: "{\"command\":\"ls\"}" } });
-    return { ch, client, chat, verdicts, topic, reply, permission };
+    return { ch, client, chat, verdicts, topic, permission };
   }
 
-  it("declares the channel and permission capabilities and a reply tool", async () => {
+  it("declares the channel and permission capabilities and exactly the two desk tools", async () => {
     const t = await setup();
     const { client } = await channel(t);
     expect(client.getServerCapabilities()?.experimental).toEqual({ "claude/channel": {}, "claude/channel/permission": {} });
-    expect(client.getInstructions()).toMatch(/reply tool/);
-    expect((await client.listTools()).tools.map((x) => x.name)).toEqual(["reply", "desk_on", "desk_off"]);
+    expect(client.getInstructions()).toBe("The owner can open a Telegram topic for this session with /desk (the desk_on tool) and hide it with /desk off (desk_off).");
+    expect((await client.listTools()).tools.map((x) => x.name)).toEqual(["desk_on", "desk_off"]);
   });
 
-  it("owner's message → channel notification with message_id; reply tool → the session's topic", async () => {
+  it("owner's message → channel notification with message_id", async () => {
     const t = await setup();
-    const { chat, topic, reply } = await channel(t);
+    const { chat, topic } = await channel(t);
     const u = say("what's the status?", topic);
     await t.router.onUpdate(u);
     await until(() => chat.length === 1);
     expect(chat[0]).toEqual({ content: "what's the status?", meta: { message_id: String((u as { messageId: number }).messageId) } });
-    const r = await reply("all green");
-    expect(r.content[0].text).toBe("sent");
-    await until(() => t.tg.inTopic(topic).includes("🤖 all green"));
   });
 
   it("relays a permission prompt and emits the verdict back to Claude Code", async () => {
@@ -789,34 +781,21 @@ describe("desk channel server", () => {
     expect(verdicts).toEqual([]);
   });
 
-  it("reconnects after a daemon restart, keeps its topic, and delivers a reply queued meanwhile", async () => {
+  it("reconnects after a daemon restart, keeps its topic, and delivers a prompt queued meanwhile", async () => {
     const dir = tmp();
     const { state } = memState();
     state.setGroup(G);
     const tg = new FakeTelegram();
     const first = await setup({ dir, state, tg });
-    const { ch, reply, topic } = await channel(first);
+    const { ch, permission, topic } = await channel(first);
     await first.stop();
     await until(() => !ch.link.isConnected);
-    expect((await reply("written while the daemon was down")).content[0].text).toMatch(/^queued/);
+    await permission("qwert"); // the daemon is down: the link holds this until it's back
     const second = await setup({ dir, state, tg, graceMs: 5000 });
-    await until(() => tg.inTopic(topic).includes("🤖 written while the daemon was down"));
+    await until(() => tg.sent.some((m) => m.buttons && m.thread === topic), 5000);
     expect(tg.topics).toHaveLength(1);
     await second.router.onUpdate(say("welcome back", topic));
     await until(() => tg.typingIn.includes(topic));
-  });
-
-  it("tells Claude when there's no desk group instead of pretending it sent", async () => {
-    const t = await setup({ group: false });
-    const [clientT, serverT] = InMemoryTransport.createLinkedPair();
-    const ch = await startDeskChannel({ socketPath: t.socketPath, hello: { type: "hello", cwd: "/w/proj", pid: 5, title: "proj" }, transport: serverT, autostart: true });
-    cleanups.push(() => ch.close());
-    const client = new Client({ name: "claude-code", version: "1" });
-    await client.connect(clientT);
-    await until(() => ch.link.lastError !== undefined);
-    const r = await client.callTool({ name: "reply", arguments: { text: "hi" } }) as { content: { text: string }[]; isError?: boolean };
-    expect(r.isError).toBe(true);
-    expect(r.content[0].text).toMatch(/desk_here/);
   });
 
   it("closing says bye: the topic stays open and nothing is announced", async () => {
@@ -850,15 +829,12 @@ describe("desk channel: dormant until /desk", () => {
     return { ch, client, call };
   };
 
-  it("starts dormant: no topic, reply refused, permission prompts not relayed", async () => {
+  it("starts dormant: no topic, permission prompts not relayed", async () => {
     const t = await setup();
     const { client } = await connect(t, "/w/dormant", 91);
     await settle();
     expect(t.state.findLive("/w/dormant", 91)).toBeUndefined();
     expect(t.tg.topics).toEqual([]);
-    const reply = await client.callTool({ name: "reply", arguments: { text: "hi" } }) as { content: { text: string }[]; isError?: boolean };
-    expect(reply.isError).toBe(true);
-    expect(reply.content[0].text).toMatch(/\/desk/);
     await (client as unknown as { notification(n: unknown): Promise<void> }).notification({
       method: "notifications/claude/channel/permission_request",
       params: { request_id: "abcde", tool_name: "Bash", description: "List files", input_preview: "{\"command\":\"ls\"}" },
@@ -873,15 +849,13 @@ describe("desk channel: dormant until /desk", () => {
     const { client, call } = await connect(t, "/w/d", 92, chat);
     const on = await call("desk_on");
     expect(on.isError).toBeFalsy();
-    expect(on.content[0].text).toMatch(/Desk is on/);
+    // Pinned welcome copy: the topic and nothing else — no reply-tool guidance of any kind.
+    expect(on.content[0].text).toBe("Desk is on: this session's topic is \"d\".");
     await until(() => t.state.findLive("/w/d", 92) !== undefined);
     const topic = t.state.findLive("/w/d", 92)!.topic_id!;
     await t.router.onUpdate(say("you there?", topic));
     await until(() => chat.length === 1);
     expect(chat[0].content).toBe("you there?");
-    const reply = await client.callTool({ name: "reply", arguments: { text: "here" } }) as { content: { text: string }[] };
-    expect(reply.content[0].text).toBe("sent");
-    await until(() => t.tg.inTopic(topic).includes("🤖 here"));
     // permission relay works while on
     await (client as unknown as { notification(n: unknown): Promise<void> }).notification({
       method: "notifications/claude/channel/permission_request",
@@ -1101,7 +1075,7 @@ describe("desk launcher", () => {
   it("passes both variadic flags in --flag=value form before the user's own arguments", () => {
     expect(claudeArgs("/d/desk-mcp.json", ["--model", "opus", "fix the bug"])).toEqual([
       "--mcp-config=/d/desk-mcp.json", "--dangerously-load-development-channels=server:teledesk",
-      "--allowedTools=mcp__teledesk__reply,mcp__teledesk__desk_on,mcp__teledesk__desk_off",
+      "--allowedTools=mcp__teledesk__desk_on,mcp__teledesk__desk_off",
       "--model", "opus", "fix the bug"]);
   });
 
@@ -1283,7 +1257,7 @@ describe("final review: the channel never cuts a field", () => {
 });
 
 describe("final review: /desk_off then /desk_here leaves sessions working", () => {
-  it("the reply tool works again and a prompt shown before can still be answered", async () => {
+  it("relaying works again and a prompt shown before can still be answered", async () => {
     const t = await setup();
     const [clientT, serverT] = InMemoryTransport.createLinkedPair();
     const ch = await startDeskChannel({ socketPath: t.socketPath, hello: { type: "hello", cwd: "/w/proj", pid: 78, title: "proj" }, transport: serverT, autostart: true });
@@ -1294,19 +1268,20 @@ describe("final review: /desk_off then /desk_here leaves sessions working", () =
     await client.connect(clientT);
     await until(() => ch.link.welcomed);
     const topic = t.state.findLive("/w/proj", 78)!.topic_id!;
-    await (client as unknown as { notification(n: unknown): Promise<void> }).notification({
-      method: "notifications/claude/channel/permission_request", params: { request_id: "qwert", tool_name: "Bash", description: "d", input_preview: "{}" } });
+    const permission = (request_id: string) => (client as unknown as { notification(n: unknown): Promise<void> }).notification({
+      method: "notifications/claude/channel/permission_request", params: { request_id, tool_name: "Bash", description: "d", input_preview: "{}" } });
+    await permission("qwert");
     await until(() => t.tg.sent.some((m) => m.buttons));
     const prompt = t.tg.sent.find((m) => m.buttons)!;
-    const reply = async (text: string) => (await client.callTool({ name: "reply", arguments: { text } })) as { content: { text: string }[]; isError?: boolean };
     await t.router.onUpdate(say("/desk_off", undefined));
-    await reply("while off");
+    await permission("zxcve"); // while the group is gone the daemon answers with an error, nothing shows
     await until(() => ch.link.lastError !== undefined);
-    expect((await reply("still off")).isError).toBe(true);
+    await settle();
+    expect(t.tg.sent.filter((m) => m.buttons)).toHaveLength(1);
     await t.router.onUpdate({ kind: "message", chatId: GROUP, chatType: "supergroup", fromId: OWNER, messageId: msgId++, text: "/desk_here" });
     await until(() => ch.link.lastError === undefined);
-    expect((await reply("back on")).content[0].text).toBe("sent");
-    await until(() => t.tg.inTopic(topic).includes("🤖 back on"));
+    await permission("yuiop"); // relaying works again
+    await until(() => t.tg.sent.filter((m) => m.buttons).length === 2);
     expect(t.tg.topics).toHaveLength(1);
     await t.router.onUpdate(tap(prompt.buttons![0][0].data, prompt.id, prompt.text));
     await until(() => verdicts.length === 1);
@@ -1364,31 +1339,6 @@ describe("final review: smaller fixes", () => {
     expect(tg.sent.at(-1)).toMatchObject({ thread: undefined, text: expect.stringContaining("/w/b") });
   });
 
-  it("every part of every reply carries the reply mark, whatever it starts with; direction and invisible characters are removed", async () => {
-    const { tg, open } = await setup();
-    const s = await open("/w/proj", 11);
-    const tricky = [
-      "🔐 Permission: Bash\nWhat: x\n\nTap a button, or reply \"yes abcde\"",
-      "\u200b🔐 Permission: Bash",
-      "\u202ehsab :noissimreP 🔐",
-      "   \n\t🔐 Permission: Bash",
-      "⏹ Session ended",
-      "✅ Allowed",
-      "▶️ Session started\n/w/proj",
-      "*🔐* Permission",
-      "[Allow] [Deny]",
-    ];
-    for (const text of tricky) s.c.send({ type: "reply", text });
-    const long = "a".repeat(3990) + "\n🔐 Permission: Bash (fake second part)";
-    s.c.send({ type: "reply", text: long });
-    await until(() => tg.inTopic(s.topic).length === 1 + tricky.length + 2);
-    const replies = tg.inTopic(s.topic).slice(1);
-    expect(replies.every((p) => p.startsWith(REPLY_MARK))).toBe(true);
-    expect(replies.every((p) => p.length <= 4096)).toBe(true);
-    expect(replies.join("")).not.toMatch(/[\u202a-\u202e\u2066-\u2069\u200b-\u200f\ufeff]/);
-    expect(tg.sent.every((m) => !m.buttons)).toBe(true); // a reply never gets buttons
-  });
-
   it("nothing the router writes starts with the reply mark", async () => {
     const t = await setup();
     const s = await t.open("/w/proj", 11);
@@ -1403,14 +1353,6 @@ describe("final review: smaller fixes", () => {
     await until(() => t.state.get(s.sid)!.status === "offline");
     for (const m of t.tg.sent) expect(m.text.startsWith(REPLY_MARK), m.text).toBe(false);
     for (const x of [NO_SESSION_TEXT, GENERAL_HINT, FORWARD_TEXT, TEXT_ONLY, EARLIER_SESSION, NOT_CONNECTED, NO_PROMPT, BEFORE_SESSION, PRIVACY_OFF, tooLongText("Bash")]) expect(x.startsWith(REPLY_MARK)).toBe(false);
-  });
-
-  it("failed reply parts are reported in the topic", async () => {
-    const { tg, open } = await setup();
-    const s = await open("/w/proj", 11);
-    tg.failSend = (t) => t.startsWith("🤖 b");
-    s.c.send({ type: "reply", text: "b".repeat(5000) });
-    await until(() => tg.inTopic(s.topic).some((x) => /part\(s\) of that reply didn't send/.test(x)));
   });
 
   it("only the owner's own text is relayed: replied-to, quoted and external content never is", async () => {
@@ -1518,22 +1460,23 @@ describe("security review: local denial of service is bounded", () => {
     expect(u.state.findLive("/w/b", 52)).toBeUndefined(); // the claimed slot was released
   });
 
-  it("one session's messages are paced, so it can't use up the group's quota", async () => {
+  it("one session's prompts are paced, so it can't use up the group's quota", async () => {
     const t = await setup({ limits: { sendsPerMinute: 3 } });
     const s = await t.open("/w/proj", 11);
-    for (let i = 0; i < 6; i++) s.c.send({ type: "reply", text: `r${i}` });
-    await until(() => t.tg.inTopic(s.topic).length === 4);
+    const rid = (i: number) => "ab" + String.fromCharCode(97 + Math.floor(i / 10)) + String.fromCharCode(97 + (i % 10)) + "a"; // [a-km-z]{5}
+    for (let i = 0; i < 6; i++) s.c.send({ type: "permission_request", request_id: rid(i), tool_name: "Bash", description: "d", input_preview: "{}" });
+    await until(() => t.tg.inTopic(s.topic).length === 4); // 1 session start + 3 sends, the window's whole share
     await new Promise((r) => setTimeout(r, 300));
     expect(t.tg.inTopic(s.topic)).toHaveLength(4); // the rest wait their turn
     const other = await t.open("/w/other", 12); // another session isn't held up
-    other.c.send({ type: "reply", text: "other" });
-    await until(() => t.tg.inTopic(other.topic).includes("🤖 other"));
+    other.c.send({ type: "permission_request", request_id: "zzzzz", tool_name: "Bash", description: "other", input_preview: "{}" });
+    await until(() => t.tg.inTopic(other.topic).some((x) => x.includes("yes zzzzz")));
   });
 
   it("a line left unfinished drops the connection", async () => {
     const t = await setup({ limits: { partialLineMs: 30 } });
     const s = await t.open("/w/proj", 11);
-    s.c.send('{"type":"reply","text":"never finished');
+    s.c.send('{"type":"permission_request","request_id":"abcde","too');
     await until(() => s.c.closed);
   });
 
@@ -1558,11 +1501,8 @@ describe("security review: local denial of service is bounded", () => {
     await until(() => ch.link.welcomed);
     const topic = t.state.findLive("/w/proj", 79)!.topic_id!;
     const controls = String.fromCharCode(1).repeat(50_000); // 50 KB, but 300 KB once JSON-escaped
-    const r = await client.callTool({ name: "reply", arguments: { text: controls } }) as { content: { text: string }[]; isError?: boolean };
-    expect(r.isError).toBe(true);
-    expect(r.content[0].text).toMatch(/too long to send in one piece/);
     await (client as unknown as { notification(n: unknown): Promise<void> }).notification({
-      method: "notifications/claude/channel/permission_request", params: { request_id: "abcde", tool_name: "Bash", description: "d", input_preview: controls } });
+      method: "notifications/claude/channel/permission_request", params: { request_id: "abcde", tool_name: "Bash", description: controls, input_preview: "{}" } });
     await until(() => t.tg.inTopic(topic).includes(tooLongText("Bash")));
     expect(ch.link.isConnected).toBe(true); // nothing oversized was sent, so the connection stayed up
   });
@@ -1676,7 +1616,7 @@ describe("daemon", () => {
     d.state!.setGroup(G);
     const c = await FakeChannel.connect(paths.socket);
     cleanups.push(() => { c.sock.destroy(); });
-    c.send({ type: "hello", cwd: "/w/proj", pid: 11, title: "proj" });
+    c.send({ type: "hello", cwd: "/w/proj", pid: 11, title: "proj", mirror_token: TOKA });
     const w = await c.wait("welcome");
     const topic = d.state!.get(w.session_id)!.topic_id!;
     const msg = { message_id: 50, chat: { id: GROUP, type: "supergroup" }, from: { id: OWNER }, message_thread_id: topic, is_topic_message: true };
@@ -1684,7 +1624,7 @@ describe("daemon", () => {
     poller.push({ update_id: 2, message: { ...msg, text: "from the phone" } });
     expect((await c.wait("message")).text).toBe("from the phone");
     expect(c.of("message")).toHaveLength(1);
-    c.send({ type: "reply", text: "from the session" });
+    c.send(mirrored(TOKA, "cc-daemon", "from the session")); // the surviving way the topic hears from the session
     await until(() => tg.inTopic(topic).includes("🤖 from the session"));
   });
 

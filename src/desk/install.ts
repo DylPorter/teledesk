@@ -56,8 +56,11 @@ export interface InstallReport { changed: string[]; skipped: string[] }
 
 // ---- the four mirror hooks (spike 2026-10-18, section (c)) ----
 
-/** The string that marks a settings.json hook command as ours: install replaces it in place and
- * uninstall strips exactly it, never touching a foreign hook that happens to share an event. */
+/** The string that marks a settings.json hook command as ours — and only in its fixed position:
+ * a command is ours if it starts with the guard followed by this marker, the exact shape both
+ * shipped forms have. A foreign command that merely *mentions* the marker mid-string stays
+ * byte-for-byte foreign: install replaces our hooks in place and uninstall strips exactly those,
+ * never touching a hook that happens to share an event or say our words. */
 export const HOOK_MARKER = "teledesk mirror-hook";
 
 /** Every hook command opens with this guard: outside a desk session (no per-spawn mirror token in
@@ -86,7 +89,8 @@ export function hookEntries(backgroundTools: boolean): Record<string, unknown> {
 }
 
 const isPlainObject = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
-const ourCommand = (h: unknown): boolean => isPlainObject(h) && typeof h.command === "string" && h.command.includes(HOOK_MARKER);
+/** Our own hooks, by literal prefix — not by the marker appearing anywhere in the command. */
+const ourCommand = (h: unknown): boolean => isPlainObject(h) && typeof h.command === "string" && h.command.startsWith(HOOK_GUARD + HOOK_MARKER);
 
 /** A group holding one of our marked hooks. */
 const groupIsOurs = (g: unknown): boolean => isPlainObject(g) && Array.isArray(g.hooks) && (g.hooks as unknown[]).some(ourCommand);

@@ -2,18 +2,21 @@
  * that mints the token into the session's child env, the channel hello that carries it,
  * and the mirror-hook CLI that classifies hook JSON and transports the lines. */
 import { afterEach, describe, expect, it } from "vitest";
-import { readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createConnection, createServer, type Socket } from "node:net";
 import { spawn } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ChannelMessage, DaemonMessage, decode, encode, LineReader, MAX_TEXT_BYTES, MIRROR_TOKEN, type MirrorMessage } from "../src/desk/protocol.js";
 import {
   extractHistory, extractTurnAssistant, MIRROR_TIMEOUT_MS, mirrorLinesFor, runMirrorHook,
   stripChannelWrapper, toolEndSummary, toolStartSummary, type HookInput,
 } from "../src/desk/mirror-hook.js";
 import { runClaude } from "../src/desk/launcher.js";
-import { HOOK_MARKER, hookEntries, mergeHookSettings, removeHookSettings } from "../src/desk/install.js";
+import { startDeskChannel } from "../src/desk/channel.js";
+import { HOOK_MARKER, hookEntries, install, mergeHookSettings, removeHookSettings, uninstall } from "../src/desk/install.js";
 import { DeskRouter, REPLY_MARK, TOOL_ICONS, type DeskLimits } from "../src/desk/router.js";
 import { SqliteDeskState } from "../src/desk/state.js";
 import { REPO_ROOT } from "../src/paths.js";
@@ -813,8 +816,9 @@ describe("tool batches", () => {
 const GUARD = '[ -n "$TELEDESK_MIRROR" ] || exit 0; ';
 const FG = GUARD + "teledesk mirror-hook";
 const BG = GUARD + "teledesk mirror-hook </dev/stdin >/dev/null 2>&1 & exit 0";
-/** Does a matcher group hold one of our marked hooks? */
-const holdsOurs = (g: any): boolean => Array.isArray(g?.hooks) && g.hooks.some((h: any) => typeof h?.command === "string" && h.command.includes(HOOK_MARKER));
+/** Does a matcher group hold one of our hooks? Same rule as the installer: the guard+marker
+ * prefix, so a foreign command that merely mentions the marker mid-string doesn't count. */
+const holdsOurs = (g: any): boolean => Array.isArray(g?.hooks) && g.hooks.some((h: any) => typeof h?.command === "string" && h.command.startsWith(GUARD + HOOK_MARKER));
 
 describe("installer hook entries", () => {
   it("hookEntries: four guarded events, marker in every command, tool events backgrounded", () => {
@@ -884,5 +888,101 @@ describe("installer hook entries", () => {
     // a foreign hook sharing our group survives: only the marked hook and any emptied group go
     const mixed = { hooks: { PreToolUse: [{ matcher: "*", hooks: [{ type: "command", command: "foreign" }, { type: "command", command: BG }] }] } };
     expect(removeHookSettings(mixed)).toEqual({ hooks: { PreToolUse: [{ matcher: "*", hooks: [{ type: "command", command: "foreign" }] }] } });
+  });
+
+  it("a foreign hook that merely mentions the marker mid-command isn't ours: it survives install and uninstall intact", () => {
+    // Ownership is the guard+marker PREFIX, not a substring anywhere: a foreign command that
+    // happens to say "teledesk mirror-hook" (logging it, quoting it…) must never be stripped.
+    const home = tmp();
+    mkdirSync(join(home, ".claude"), { recursive: true });
+    const settings = join(home, ".claude", "settings.json");
+    const foreignGroup = { matcher: "Bash", hooks: [{ type: "command", command: "sh -c 'echo seen by the teledesk mirror-hook watcher; exit 0'" }] };
+    writeFileSync(settings, JSON.stringify({ hooks: { PreToolUse: [foreignGroup] } }, null, 2) + "\n");
+    expect(install(home).changed.some((c) => c.includes(settings))).toBe(true); // settings.json was written (rc files: expected skips, they don't exist here)
+    let s = JSON.parse(readFileSync(settings, "utf8"));
+    expect(s.hooks.PreToolUse[0]).toEqual(foreignGroup); // untouched, and still first
+    expect(s.hooks.PreToolUse.filter(holdsOurs)).toHaveLength(1); // ours was appended, not swapped in over theirs
+    uninstall(home);
+    s = JSON.parse(readFileSync(settings, "utf8"));
+    expect(s.hooks.PreToolUse).toEqual([foreignGroup]); // ours stripped, the foreign one byte-for-byte intact
+  });
+});
+
+// ---- the shipped cycle: the desk is a wiretap, and the reply path is gone ----
+
+const PINNED_INSTRUCTIONS = "The owner can open a Telegram topic for this session with /desk (the desk_on tool) and hide it with /desk off (desk_off).";
+
+describe("mirror cycle", () => {
+  it("the whole wiretap, in order: prompt, collapsed reads, a new tool, turn close, answer", async () => {
+    const { tg, socketPath, open } = await deskSetup();
+    const d = await open("/w/proj", 11, TOKEN);
+    const post = async (line: MirrorMessage["line"]) => { await mirrorSocket(socketPath, mirror(line)); };
+
+    await post({ kind: "user_prompt", text: "make it so" });
+    await until(() => tg.inTopic(d.topic).includes("🧑 make it so"));
+
+    for (const f of ["one.md", "two.md", "three.md"]) {
+      await post({ kind: "tool_start", tool_name: "Read", summary: f });
+      await post({ kind: "tool_end", tool_name: "Read", ok: true, summary: "read it" });
+    }
+    await post({ kind: "tool_start", tool_name: "Bash", summary: "ls -la" });
+    await until(() => tg.sent.some((s) => s.text.startsWith("🖥 Bash")));
+    await post({ kind: "turn_end" });
+    await until(() => tg.edits.some((e) => e.text.startsWith("✅ Bash")));
+    await post({ kind: "assistant", text: "done." });
+    await until(() => tg.inTopic(d.topic).includes("🤖 done."));
+
+    // Four messages in the topic, in the order they happened: the run's opener, one bubble for
+    // the three reads, the type change's new bubble, the answer. Nothing else was ever sent.
+    expect(tg.inTopic(d.topic)).toEqual([
+      expect.stringMatching(/^▶️ Session started/),
+      "🧑 make it so",
+      "📖 Read: one.md",
+      "🖥 Bash: ls -la",
+      "🤖 done.",
+    ]);
+    // The Read run: one send, folded by edits, closed ✅ when the Bash start changed the type.
+    const read = tg.sent.filter((s) => s.text.startsWith("📖 Read"));
+    expect(read).toHaveLength(1);
+    expect(tg.edits.filter((e) => e.id === read[0].id).map((e) => e.text)).toEqual([
+      "📖 Read ×1 … read it",
+      "📖 Read ×2 … two.md",
+      "📖 Read ×2 … read it",
+      "📖 Read ×3 … three.md",
+      "📖 Read ×3 … read it",
+      "✅ Read ×3 — read it",
+    ]);
+    // The Bash bubble closed on turn_end; the batch machine has the last word.
+    expect(tg.edits.at(-1)!.text).toBe("✅ Bash ×1 — ls -la");
+  }, 20_000);
+
+  it("a stale reply line is ignored, not fatal", async () => {
+    // A channel from before this upgrade still sends {"type":"reply",…}. It no longer decodes:
+    // the reader answers with one error line and the connection lives on — no crash, nothing posted.
+    const { tg, socketPath, open } = await deskSetup();
+    const d = await open("/w/proj", 11, TOKEN);
+    const n = tg.sent.length;
+    d.c.send({ type: "reply", text: "pre-upgrade words" });
+    await until(() => d.c.got.some((m) => m.type === "error"));
+    expect(d.c.got.find((m) => m.type === "error")).toEqual({ type: "error", reason: "That wasn't a valid desk message." });
+    expect(tg.sent.length).toBe(n); // nothing posted
+    expect(d.c.sock.destroyed).toBe(false); // and the connection survives…
+    d.c.send(mirror({ kind: "assistant", text: "still working" })); // …still working
+    await until(() => tg.inTopic(d.topic).includes("🤖 still working"));
+    expect(tg.sent.some((s) => s.text.includes("pre-upgrade"))).toBe(false);
+  });
+
+  it("ListTools returns exactly desk_on and desk_off; reply is an unknown tool; instructions are one sentence", async () => {
+    const { socketPath } = await deskSetup();
+    const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+    const ch = await startDeskChannel({ socketPath, hello: { type: "hello", cwd: "/w/proj", pid: 11, title: "proj", mirror_token: TOKEN }, transport: serverT, backoff: { min: 10, max: 40 } });
+    cleanups.push(() => ch.close());
+    const client = new Client({ name: "claude-code", version: "1" });
+    await client.connect(clientT);
+    expect((await client.listTools()).tools.map((t) => t.name)).toEqual(["desk_on", "desk_off"]);
+    expect(client.getInstructions()).toBe(PINNED_INSTRUCTIONS);
+    const r = (await client.callTool({ name: "reply", arguments: { text: "hi" } })) as { content: { text: string }[]; isError?: boolean };
+    expect(r.isError).toBe(true);
+    expect(r.content[0].text).toMatch(/unknown tool/);
   });
 });

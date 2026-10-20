@@ -15,10 +15,9 @@ export function deskMcpConfig(command: string, args: string[]): { mcpServers: Re
   return { mcpServers: { [CHANNEL_NAME]: { type: "stdio", command, args } } };
 }
 
-/** The reply tool, pre-allowed so each answer to the owner doesn't need a permission tap. */
-export const REPLY_TOOL = `mcp__${CHANNEL_NAME}__reply`;
-/** Reply plus the desk on/off tools (/desk): using the desk itself never needs a tap. */
-export const DESK_TOOLS = [REPLY_TOOL, `mcp__${CHANNEL_NAME}__desk_on`, `mcp__${CHANNEL_NAME}__desk_off`].join(",");
+/** The desk on/off tools (/desk): using the desk itself never needs a tap. Nothing else is
+ * pre-allowed — the reply tool is gone, so the model has no outbound path to the topic. */
+export const DESK_TOOLS = [`mcp__${CHANNEL_NAME}__desk_on`, `mcp__${CHANNEL_NAME}__desk_off`].join(",");
 
 /** These flags take several values, so they're given in --flag=value form: a prompt or other
  * argument after them can't be swallowed as another config file, channel or tool. */

@@ -1,8 +1,10 @@
 /** The channel server for one Claude Code session (`teledesk desk-channel`): a stdio
  * MCP server that Claude Code loads as a channel (research preview, see
  * https://code.claude.com/docs/en/channels-reference). It connects to the daemon's
- * desk socket and relays: the owner's Telegram messages → this session, replies and
- * permission prompts → the session's topic, and permission verdicts back. */
+ * desk socket and relays: the owner's Telegram messages → this session, permission
+ * prompts → the session's topic, and permission verdicts back. What the phone *reads*
+ * never passes through this server: the session's hooks mirror that as protocol `mirror`
+ * lines on their own. The model has no outbound text path to the topic — by design. */
 import { createConnection, type Socket } from "node:net";
 import { lstatSync } from "node:fs";
 import { execFileSync } from "node:child_process";
@@ -24,13 +26,10 @@ export const ENV_GUARD = "TELEDESK";
 export const ENV_MIRROR = "TELEDESK_MIRROR";
 export const REFUSAL = `teledesk desk-channel: not starting, because ${ENV_GUARD}=1 isn't set. This server only runs inside a session started with \`teledesk code\`, which sets it.\n`;
 
-export const INSTRUCTIONS = [
-  "The owner can talk to this session from Telegram while its desk topic is on. They turn it on with /desk (which calls the desk_on tool) and off with /desk off (desk_off), which quietly hides the topic until /desk again. While it's off, reply is unavailable and permission prompts go to the terminal only.",
-  `While the topic is on, their messages arrive as <channel source="${CHANNEL_NAME}" message_id="...">text</channel>; teledesk only passes on text the owner wrote themselves, from their own Telegram account (forwarded messages are never passed on).`,
-  "They read Telegram, not this terminal: anything you want them to see must go through the reply tool. Your normal transcript output never reaches them.",
-  "The topic is this session's own, so reply takes just the text. Use plain text (no Markdown rendering); long replies are split automatically.",
-  "Answer a channel message with reply, even briefly, so they know you got it.",
-].join("\n");
+/** Exactly one sentence, and no outbound guidance of any kind: the desk is a wiretap, the
+ * model chooses nothing about what the phone sees, so it gets nothing to act on about it. */
+export const INSTRUCTIONS =
+  "The owner can open a Telegram topic for this session with /desk (the desk_on tool) and hide it with /desk off (desk_off).";
 
 /** Pending outbound messages kept while the daemon is unreachable. */
 const QUEUE_MAX = 50;
@@ -55,7 +54,7 @@ export class DaemonLink {
   private timer?: NodeJS.Timeout;
   private queue: ChannelMessage[] = [];
   private warned = false;
-  /** The daemon's last error since connecting (e.g. no desk group): replies would go nowhere. */
+  /** The daemon's last error since connecting (e.g. no desk group): prompts would go nowhere. */
   lastError?: string;
   welcomed = false;
 
@@ -167,8 +166,8 @@ const ACTIVATE_TIMEOUT_MS = 15_000;
 
 /** Build the MCP server and the daemon link, and connect the server to `transport`. The link
  * stays dormant (never dials the daemon, no topic) until the desk_on tool — what the owner's
- * /desk runs — unless `autostart` is set. Dormant means: replies refused, permission prompts
- * left to the terminal, nothing reaches Telegram. */
+ * /desk runs — unless `autostart` is set. Dormant means: permission prompts left to the
+ * terminal and nothing reaches Telegram. */
 export async function startDeskChannel(o: { socketPath: string; hello: Hello; transport: Transport; log?: (m: string) => void; backoff?: { min: number; max: number }; autostart?: boolean }): Promise<DeskChannel> {
   const log = o.log ?? (() => {});
   const server = new Server({ name: CHANNEL_NAME, version: "1.0.0" }, {
@@ -212,11 +211,6 @@ export async function startDeskChannel(o: { socketPath: string; hello: Hello; tr
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: [
       {
-        name: "reply",
-        description: "Send a message to the owner in this session's Telegram topic (works while the desk is on). Plain text; long text is split automatically.",
-        inputSchema: { type: "object", properties: { text: { type: "string", description: "The message" } }, required: ["text"] },
-      },
-      {
         name: "desk_on",
         description: "Open this session's Telegram topic so the owner can talk to it from their phone. This is what the owner's /desk runs.",
         inputSchema: { type: "object", properties: {} },
@@ -235,7 +229,7 @@ export async function startDeskChannel(o: { socketPath: string; hello: Hello; tr
       if (activated && link.welcomed && topicName !== undefined) return ok(`Desk is already on: this session's topic is "${topicName}".`);
       activated = true;
       const r = await activate();
-      if (r.kind === "welcome") return ok(`Desk is on: this session's topic is "${r.topic}". The owner reads Telegram, not this terminal: anything they should see goes through the reply tool.`);
+      if (r.kind === "welcome") return ok(`Desk is on: this session's topic is "${r.topic}".`);
       if (r.kind === "unreachable") return ok("Desk is on, but the teledesk daemon isn't reachable right now; the topic opens as soon as it is.");
       return fail(`Desk couldn't open a topic: ${r.reason}`);
     }
@@ -246,15 +240,8 @@ export async function startDeskChannel(o: { socketPath: string; hello: Hello; tr
       await link.detach(true);
       return ok("Desk is off: relaying stopped and permission prompts are terminal-only again. The topic is quietly hidden from the list; /desk brings the same one back.");
     }
-    if (req.params.name !== "reply") return fail(`unknown tool: ${req.params.name}`);
-    const text = (req.params.arguments as { text?: unknown } | undefined)?.text;
-    if (typeof text !== "string" || !text.trim()) return fail("reply needs non-empty text");
-    if (Buffer.byteLength(text, "utf8") > MAX_TEXT_BYTES || !fits({ type: "reply", text })) return fail(`That's too long to send in one piece (${MAX_TEXT_BYTES / 1024} KB at most); send it in parts.`);
-    if (!activated) return fail("Desk is off in this session: nothing reaches the owner's Telegram. They can turn it on with /desk.");
-    if (link.isConnected && link.lastError) return fail(`Not sent: ${link.lastError}`);
-    const r = link.send({ type: "reply", text });
-    if (r === "dropped") return fail("Not sent: the teledesk daemon isn't reachable and too many messages are already waiting.");
-    return ok(r === "sent" ? "sent" : "queued: the teledesk daemon isn't reachable right now; this goes out when it's back");
+    // The reply tool died with the mirror redesign: the model has no path to the topic.
+    return fail(`unknown tool: ${req.params.name}`);
   });
   server.setNotificationHandler(PermissionRequest, async ({ params }) => {
     // Dormant: the terminal is the only place this prompt exists; there's nothing to relay.

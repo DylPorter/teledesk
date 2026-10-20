@@ -34,8 +34,8 @@ const PENDING_KEEP = 50;
 /** Above this many unhandled messages a connection stops being read until it catches up. */
 const BACKLOG_PAUSE = 8;
 const BACKLOG_RESUME = 2;
-/** Every part of a Claude reply starts with this, and nothing the router writes ever does: the
- * owner can always tell Claude's words from the router's own messages and prompts. */
+/** Every part of a mirrored Claude answer starts with this, and nothing the router writes itself
+ * ever does: the owner can always tell Claude's words from the router's own messages and prompts. */
 export const REPLY_MARK = "🤖 ";
 /** Prompts the session's hooks report (and the terminal user typed) start with this. */
 export const MIRROR_MARK = "🧑 ";
@@ -85,7 +85,8 @@ export const DEFAULT_LIMITS: DeskLimits = { sessions: 20, startsPerMinute: 10, t
 /** Size bound for the sets and maps that remember senders, chats and notices. */
 const MEMORY_KEEP = 1000;
 /** Control characters (newlines and tabs stay), direction overrides and invisible characters
- * come out of replies, so a reply can't reorder or hide what's around it. */
+ * come out of transcript-sourced text, so a mirrored line can't reorder or hide what's around it.
+ * Every posted line — mirrored chat, tool summaries, snapshots — gets this scrub. */
 const REPLY_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g;
 export const replyText = (t: string) => t.replace(REPLY_CONTROL, " ").replace(INVISIBLE, "");
 /** How often the forwarded-message notice may repeat in one topic. */
@@ -419,12 +420,6 @@ export class DeskRouter {
     if (m.type === "mirror") { await this.mirrorLine(m); return; }
     const row = this.topicOf(conn);
     if (!row) { this.write(conn, { type: "error", reason: this.state.group() ? "This session has no topic yet." : NO_GROUP_REASON }); return; }
-    if (m.type === "reply") {
-      // Every part carries the reply mark, whatever Claude wrote: it can't pass for the router.
-      const failed = await this.post(row.group_id, row.topic_id, replyText(m.text), { shape: (p) => REPLY_MARK + p, before: () => this.pace(conn) });
-      if (failed) await this.post(row.group_id, row.topic_id, `⚠️ ${failed} part(s) of that reply didn't send.`);
-      return;
-    }
     if (m.type === "permission_request") await this.prompt(conn, row, m);
   }
 
@@ -547,7 +542,7 @@ export class DeskRouter {
         const now = Date.now();
         if (now - st.lastHistoryAt >= HISTORY_COOLDOWN_MS) {
           st.lastHistoryAt = now;
-          // Transcript text gets the same control-char/invisible scrub as every other reply (Ruling 14).
+          // Transcript text gets the same control-char/invisible scrub as every other posted line (Ruling 14).
           await this.post(row.group_id, row.topic_id, replyText(HISTORY_MARK + "Recent chat:\n\n" + line.text));
         }
         return;
@@ -902,7 +897,7 @@ export class DeskRouter {
   }
 
   /** /desk_here from the owner: make this group the desk group if it's ready and private, else
-   * say what's missing. Anyone else in the group could read every reply and permission preview. */
+   * say what's missing. Anyone else in the group could read every mirrored line and permission preview. */
   private async deskHere(chatId: string, threadId?: number): Promise<void> {
     const missing: string[] = [];
     try {
