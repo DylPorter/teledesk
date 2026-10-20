@@ -14,7 +14,7 @@ import { deskPaths, ensureDataDir, migrateLegacyDataDir, REPO_ROOT } from "./pat
 const USAGE = `teledesk — your Claude Code sessions in Telegram topics
 
   teledesk code [claude args…]   start Claude Code desk-capable (its topic opens with /desk)
-  teledesk install               make plain \`claude\` desk-capable + add the /desk command
+  teledesk install               make plain \`claude\` desk-capable: add the /desk command + the mirror hooks
   teledesk install --shim        also put a desk-aware \`claude\` in ~/bin, which reaches shells
                                  that never read the rc file (old tmux panes, sh -c, systemd)
   teledesk uninstall             remove what install added

@@ -13,6 +13,7 @@ import {
   stripChannelWrapper, toolEndSummary, toolStartSummary, type HookInput,
 } from "../src/desk/mirror-hook.js";
 import { runClaude } from "../src/desk/launcher.js";
+import { HOOK_MARKER, hookEntries, mergeHookSettings, removeHookSettings } from "../src/desk/install.js";
 import { DeskRouter, REPLY_MARK, TOOL_ICONS, type DeskLimits } from "../src/desk/router.js";
 import { SqliteDeskState } from "../src/desk/state.js";
 import { REPO_ROOT } from "../src/paths.js";
@@ -797,5 +798,84 @@ describe("tool batches", () => {
     await until(() => tg.inTopic(d.topic).includes("🧑 after the bye"), 4000);
     expect(tg.inTopic(d.topic).includes("🧑 held up")).toBe(true);
     expect(state.get(d.sid)!.status).toBe("live");
+  });
+});
+
+// ---- installer: the four mirror hooks (Task 9, pure functions) ----
+
+const GUARD = '[ -n "$TELEDESK_MIRROR" ] || exit 0; ';
+const FG = GUARD + "teledesk mirror-hook";
+const BG = GUARD + "teledesk mirror-hook </dev/stdin >/dev/null 2>&1 & exit 0";
+/** Does a matcher group hold one of our marked hooks? */
+const holdsOurs = (g: any): boolean => Array.isArray(g?.hooks) && g.hooks.some((h: any) => typeof h?.command === "string" && h.command.includes(HOOK_MARKER));
+
+describe("installer hook entries", () => {
+  it("hookEntries: four guarded events, marker in every command, tool events backgrounded", () => {
+    const e = hookEntries(true) as any;
+    expect(Object.keys(e).sort()).toEqual(["PostToolUse", "PreToolUse", "Stop", "UserPromptSubmit"]);
+    expect(e.UserPromptSubmit).toEqual([{ hooks: [{ type: "command", command: FG }] }]);
+    expect(e.Stop).toEqual([{ hooks: [{ type: "command", command: FG }] }]);
+    expect(e.PreToolUse).toEqual([{ matcher: "*", hooks: [{ type: "command", command: BG }] }]);
+    expect(e.PostToolUse).toEqual([{ matcher: "*", hooks: [{ type: "command", command: BG }] }]);
+    // the chat events carry no tool matcher
+    expect("matcher" in e.UserPromptSubmit[0]).toBe(false);
+    expect("matcher" in e.Stop[0]).toBe(false);
+    // backgroundTools:false falls back to the foreground form on the tool events too
+    const fg = hookEntries(false) as any;
+    expect(fg.PreToolUse[0].hooks[0].command).toBe(FG);
+    expect(fg.PostToolUse[0].hooks[0].command).toBe(FG);
+  });
+
+  it("merge into an empty settings object yields exactly the four entries", () => {
+    expect(mergeHookSettings({}, hookEntries(true))).toEqual({ hooks: hookEntries(true) });
+  });
+
+  it("merge into existing unrelated hooks preserves them, other events, and other settings keys", () => {
+    const foreign = {
+      model: "sonnet",
+      permissions: { allow: ["Bash"] },
+      hooks: {
+        PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "python3 other.py", timeout: 5 }] }],
+        SessionStart: [{ hooks: [{ type: "command", command: "echo hi" }] }],
+      },
+    };
+    const merged = mergeHookSettings(foreign, hookEntries(true)) as any;
+    expect(merged.model).toBe("sonnet");
+    expect(merged.permissions).toEqual({ allow: ["Bash"] });
+    // the foreign PreToolUse group is untouched, our group appended
+    expect(merged.hooks.PreToolUse[0]).toEqual(foreign.hooks.PreToolUse[0]);
+    expect(holdsOurs(merged.hooks.PreToolUse[1])).toBe(true);
+    // an event we never install is left completely alone
+    expect(merged.hooks.SessionStart).toEqual(foreign.hooks.SessionStart);
+    // our other three events were added
+    for (const ev of ["UserPromptSubmit", "Stop", "PostToolUse"]) expect(holdsOurs(merged.hooks[ev][0])).toBe(true);
+  });
+
+  it("merge is idempotent — the third run's output deep-equals the second's", () => {
+    const foreign = { model: "sonnet", hooks: { PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "python3 other.py" }] }] } };
+    const entries = hookEntries(true);
+    const once = mergeHookSettings(foreign, entries);
+    const twice = mergeHookSettings(once, entries);
+    const thrice = mergeHookSettings(twice, entries);
+    expect(twice).toEqual(once);
+    expect(thrice).toEqual(once);
+    // exactly one marked group per event survives repeated merges
+    const m = once as any;
+    for (const ev of ["UserPromptSubmit", "Stop", "PreToolUse", "PostToolUse"]) {
+      expect(m.hooks[ev].filter(holdsOurs)).toHaveLength(1);
+    }
+  });
+
+  it("remove strips only marked entries and restores the foreign content exactly", () => {
+    const foreign = { model: "sonnet", hooks: { PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "python3 other.py" }] }] } };
+    const merged = mergeHookSettings(foreign, hookEntries(true));
+    expect(removeHookSettings(merged)).toEqual(foreign);
+  });
+
+  it("remove prunes an event that held only our hook, and the hooks object when it empties", () => {
+    expect(removeHookSettings({ hooks: { UserPromptSubmit: [{ hooks: [{ type: "command", command: FG }] }] } })).toEqual({});
+    // a foreign hook sharing our group survives: only the marked hook and any emptied group go
+    const mixed = { hooks: { PreToolUse: [{ matcher: "*", hooks: [{ type: "command", command: "foreign" }, { type: "command", command: BG }] }] } };
+    expect(removeHookSettings(mixed)).toEqual({ hooks: { PreToolUse: [{ matcher: "*", hooks: [{ type: "command", command: "foreign" }] }] } });
   });
 });

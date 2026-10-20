@@ -12,7 +12,7 @@ import { BEFORE_SESSION, DEFAULT_LIMITS, DeskRouter, REPLY_MARK, type DeskLimits
 import { SqliteDeskState, sqliteMeta } from "../src/desk/state.js";
 import { REFUSAL, runDeskChannel, startDeskChannel, type DeskChannel } from "../src/desk/channel.js";
 import { claudeArgs, deskMcpConfig, interactive, olderThan, runClaude, writeDeskConfig } from "../src/desk/launcher.js";
-import { BLOCK_START, install, installBlock, uninstall, uninstallBlock } from "../src/desk/install.js";
+import { BLOCK_START, HOOK_MARKER, install, installBlock, uninstall, uninstallBlock } from "../src/desk/install.js";
 import { cleanText, previewFields } from "../src/desk/prompt.js";
 import { BotApi } from "../src/desk/bot-api.js";
 import type { DeskUpdate } from "../src/desk/types.js";
@@ -1017,6 +1017,83 @@ describe("desk install", () => {
     expect(readFileSync(join(home, ".bashrc"), "utf8")).not.toContain(BLOCK_START);
     expect(existsSync(cmd)).toBe(false);
     expect(u.changed).toContain(cmd);
+  });
+
+  it("install writes the four mirror hooks into settings.json; uninstall restores the foreign content", () => {
+    const home = tmp();
+    mkdirSync(join(home, ".claude"), { recursive: true });
+    const foreign = { model: "sonnet", hooks: { PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "python3 foreign.py" }] }] } };
+    const settings = join(home, ".claude", "settings.json");
+    writeFileSync(settings, JSON.stringify(foreign, null, 2) + "\n");
+    install(home);
+    const s = JSON.parse(readFileSync(settings, "utf8"));
+    expect(Object.keys(s.hooks).sort()).toEqual(["PostToolUse", "PreToolUse", "Stop", "UserPromptSubmit"]);
+    const markedCommand = (ev: string) => s.hooks[ev].flatMap((g: any) => g.hooks).find((h: any) => h.command.includes(HOOK_MARKER))?.command;
+    for (const ev of ["UserPromptSubmit", "Stop", "PreToolUse", "PostToolUse"]) expect(markedCommand(ev), ev).toContain("teledesk mirror-hook");
+    // tool events use the backgrounded form; chat events run in the foreground
+    expect(markedCommand("PreToolUse")).toContain("</dev/stdin");
+    expect(markedCommand("PreToolUse")).toContain("& exit 0");
+    expect(markedCommand("PostToolUse")).toContain("& exit 0");
+    expect(markedCommand("UserPromptSubmit")).not.toContain("& exit 0");
+    expect(markedCommand("Stop")).not.toContain("& exit 0");
+    // every one carries the guard, and the foreign hook + other settings keys survive
+    for (const ev of ["UserPromptSubmit", "Stop", "PreToolUse", "PostToolUse"]) expect(markedCommand(ev)).toMatch(/^\[ -n "\$TELEDESK_MIRROR" \] \|\| exit 0; /);
+    expect(s.model).toBe("sonnet");
+    expect(s.hooks.PreToolUse.some((g: any) => g.matcher === "Bash" && g.hooks[0].command === "python3 foreign.py")).toBe(true);
+    // uninstall takes back exactly what install put in
+    uninstall(home);
+    expect(JSON.parse(readFileSync(settings, "utf8"))).toEqual(foreign);
+  });
+
+  it("install creates settings.json when it's missing; uninstall strips our hooks back out", () => {
+    const home = tmp();
+    const settings = join(home, ".claude", "settings.json");
+    install(home);
+    expect(existsSync(settings)).toBe(true);
+    const s = JSON.parse(readFileSync(settings, "utf8"));
+    expect(Object.keys(s.hooks).sort()).toEqual(["PostToolUse", "PreToolUse", "Stop", "UserPromptSubmit"]);
+    uninstall(home);
+    expect(readFileSync(settings, "utf8")).not.toContain(HOOK_MARKER);
+  });
+
+  it("install is idempotent: a second run leaves settings.json byte-for-byte and reports it skipped", () => {
+    const home = tmp();
+    mkdirSync(join(home, ".claude"), { recursive: true });
+    const settings = join(home, ".claude", "settings.json");
+    writeFileSync(settings, JSON.stringify({ model: "sonnet" }, null, 2) + "\n");
+    install(home);
+    const after = readFileSync(settings, "utf8");
+    expect(after).toContain(HOOK_MARKER);
+    const r2 = install(home);
+    expect(readFileSync(settings, "utf8")).toBe(after); // byte-identical
+    expect(r2.skipped).toContain(settings); // unchanged → skipped, not changed
+  });
+
+  it("uninstall removes hooks a previous install wrote, even after a fresh install left them", () => {
+    const home = tmp();
+    install(home);
+    install(home); // twice — proves no duplication on the second run
+    const settings = join(home, ".claude", "settings.json");
+    const s = JSON.parse(readFileSync(settings, "utf8"));
+    for (const ev of ["UserPromptSubmit", "Stop", "PreToolUse", "PostToolUse"]) {
+      expect(s.hooks[ev].filter((g: any) => g.hooks.some((h: any) => h.command.includes(HOOK_MARKER)))).toHaveLength(1);
+    }
+    uninstall(home);
+    expect(readFileSync(settings, "utf8")).not.toContain(HOOK_MARKER);
+  });
+
+  it("an unparseable settings.json is left byte-for-byte and reported skipped by both install and uninstall", () => {
+    const home = tmp();
+    mkdirSync(join(home, ".claude"), { recursive: true });
+    const settings = join(home, ".claude", "settings.json");
+    const junk = "{ this is not valid json,,, }\n";
+    writeFileSync(settings, junk);
+    const r = install(home);
+    expect(readFileSync(settings, "utf8")).toBe(junk);
+    expect(r.skipped.some((x) => x.includes(settings))).toBe(true);
+    const u = uninstall(home);
+    expect(readFileSync(settings, "utf8")).toBe(junk);
+    expect(u.skipped.some((x) => x.includes(settings))).toBe(true);
   });
 });
 
