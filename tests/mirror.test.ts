@@ -730,17 +730,24 @@ describe("tool batches", () => {
   });
 
   it("over budget, tool bubbles drop while chat flows", async () => {
-    const { tg, socketPath, open } = await deskSetup({ mirrorSendsPerMinute: 2 });
+    const { tg, router, socketPath, open } = await deskSetup({ mirrorSendsPerMinute: 1 });
     const d = await open("/w/proj", 11, TOKEN);
-    await openGate(socketPath, tg, d.topic); // 1 slot
-    await mirrorSocket(socketPath, mirror({ kind: "tool_start", tool_name: "Bash", summary: "one" })); // 2nd slot, bubbles
+    // The gate opens by injection (Ruling 16) instead of a prompt line: at the pinned 1/min an
+    // opener would eat the only slot — and this proves injections cost no budget to boot.
+    await router.onUpdate(say("go", d.topic));
+    await d.c.wait("message");
+    await mirrorSocket(socketPath, mirror({ kind: "tool_start", tool_name: "Bash", summary: "one" })); // takes the one slot, bubbles
     await until(() => bubbles(tg, "🖥 Bash").length > 0);
-    await mirrorSocket(socketPath, mirror({ kind: "tool_start", tool_name: "Read", summary: "two" })); // over budget: bubble skipped entirely
-    await until(() => tg.edits.some((e) => e.text.startsWith("✅ Bash"))); // its close was an edit, which costs no budget
-    expect(bubbles(tg, "📖 Read")).toHaveLength(0);
-    // Chat is never dropped for pacing: it waits and posts.
+    await mirrorSocket(socketPath, mirror({ kind: "tool_start", tool_name: "Read", summary: "two" })); // no slot left: bubble skipped entirely
+    await until(() => tg.edits.some((e) => e.text.startsWith("✅ Bash"))); // the old run's close was an edit, which costs no budget
+    // Its end finds no stored batch, so it folds into nothing.
+    await mirrorSocket(socketPath, mirror({ kind: "tool_end", tool_name: "Read", ok: true, summary: "two done" }));
+    // Chat is never dropped for pacing: it waits and posts. The wait outlasts any late re-post
+    // the skipped start might have paced into, so what follows is measured on a settled window:
     await mirrorSocket(socketPath, mirror({ kind: "user_prompt", text: "chat still flows" }));
     await until(() => tg.inTopic(d.topic).includes("🧑 chat still flows"), 4000);
+    expect(bubbles(tg, "📖 Read")).toHaveLength(0); // dropped outright — never sent, not even late
+    expect(tg.edits).toHaveLength(1); // still just the ✅ close: nothing edits a bubble that never posted
   });
 
   it("a failed tool closes with ❌", async () => {

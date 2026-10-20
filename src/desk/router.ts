@@ -497,19 +497,20 @@ export class DeskRouter {
     if (!row || !row.group_id || row.topic_id === null) return;
     const text = doneText(b);
     try { await this.tg.edit(row.group_id, b.messageId, text); }
-    catch { await this.tg.send(row.group_id, row.topic_id, text).catch((e) => this.log(`desk: a batch close didn't post: ${errText(e)}`)); }
+    catch { await this.tg.send(row.group_id, row.topic_id, text).catch((e) => this.logOnce(this.loggedMirrors, `batch:${rowId}`, `desk: a batch close didn't post for session ${rowId}: ${errText(e)}`)); }
   }
 
   /** Edit the open batch's bubble. If Telegram can't edit it (deleted, outside the 48h window),
    * the same text goes out as a new message and the batch re-points there: a dangling bubble is
-   * acceptable, a lost result is not. */
-  private async batchEdit(st: MirrorSession, chatId: string, threadId: number, text: string): Promise<void> {
+   * acceptable, a lost result is not. If even that send fails — a sustained outage — one log per
+   * row, never one per line: every tool_end would otherwise walk this drop path. */
+  private async batchEdit(st: MirrorSession, rowId: number, chatId: string, threadId: number, text: string): Promise<void> {
     const b = st.batch;
     if (!b) return;
     try { await this.tg.edit(chatId, b.messageId, text); }
     catch {
       try { b.messageId = await this.tg.send(chatId, threadId, text); }
-      catch (e) { this.log(`desk: a tool update was lost: ${errText(e)}`); }
+      catch (e) { this.logOnce(this.loggedMirrors, `batch:${rowId}`, `desk: a tool update was lost for session ${rowId}: ${errText(e)}`); }
     }
   }
 
@@ -564,7 +565,7 @@ export class DeskRouter {
         const open = st.batch;
         if (open && open.toolName === line.tool_name) {
           open.starts++; // fold into the run; lastSummary/lastOk are end-owned, so a late start can't rewrite them
-          await this.batchEdit(st, row.group_id, row.topic_id, runText(open, summary));
+          await this.batchEdit(st, rowId, row.group_id, row.topic_id, runText(open, summary));
           return;
         }
         await this.closeBatch(rowId); // different type: the old run gets its ✅/❌ close before this one opens
@@ -574,6 +575,7 @@ export class DeskRouter {
           return undefined;
         });
         if (id === undefined) return;
+        if (!st.gateOpen) { this.logOnce(this.loggedMirrors, `stale:${rowId}`, `desk: dropped a tool bubble that landed after its turn ended for session ${rowId}`); return; } // its text is already posted; storing it would carry an open batch past the turn boundary
         st.batch = { toolName: line.tool_name, messageId: id, starts: 1, ends: 0, lastSummary: summary, lastOk: true };
         return;
       }
@@ -585,7 +587,7 @@ export class DeskRouter {
         open.ends++; // ends only grew, and only here: lastSummary/lastOk move with it, never on an ignored or gated-out event
         open.lastSummary = summary;
         open.lastOk = line.ok;
-        await this.batchEdit(st, row.group_id, row.topic_id, runText(open, summary));
+        await this.batchEdit(st, rowId, row.group_id, row.topic_id, runText(open, summary));
         return;
       }
     }
