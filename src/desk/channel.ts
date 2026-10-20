@@ -12,7 +12,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { z } from "zod";
-import { DaemonMessage, decode, encode, LineReader, MAX_LINE_BYTES, MAX_TEXT_BYTES, REQUEST_ID, type ChannelMessage } from "./protocol.js";
+import { DaemonMessage, decode, encode, LineReader, MAX_LINE_BYTES, MAX_TEXT_BYTES, MIRROR_TOKEN, REQUEST_ID, type ChannelMessage } from "./protocol.js";
 
 /** Whether a message fits in one protocol line once encoded (JSON escaping can grow text). */
 const fits = (m: ChannelMessage) => Buffer.byteLength(encode(m), "utf8") <= MAX_LINE_BYTES;
@@ -295,7 +295,10 @@ export async function runDeskChannel(socketPath: string, env: NodeJS.ProcessEnv 
   process.on("uncaughtException", (e) => { log(`uncaught exception: ${String(e)}`); process.exit(1); });
   // Claude Code starts stdio servers in the project folder and sets CLAUDE_PROJECT_DIR.
   const cwd = resolve(env.CLAUDE_PROJECT_DIR || process.cwd());
-  const hello: Hello = { type: "hello", cwd, pid: process.pid, title: (basename(cwd) || cwd).slice(0, 256), branch: gitBranch(cwd) };
+  // The launcher's per-spawn secret, carried so the daemon can tie mirror hook lines to this
+  // session. Sent only when it's a real token; never logged anywhere in this process.
+  const token = env[ENV_MIRROR];
+  const hello: Hello = { type: "hello", cwd, pid: process.pid, title: (basename(cwd) || cwd).slice(0, 256), branch: gitBranch(cwd), ...(token && MIRROR_TOKEN.test(token) ? { mirror_token: token } : {}) };
   const ch = await startDeskChannel({ socketPath, hello, transport: new StdioServerTransport(), log });
   // When Claude Code exits, stdin closes: say a plain bye (the topic stays as it is), then exit.
   let done = false;
