@@ -496,7 +496,8 @@ export class DeskRouter {
       case "user_prompt": {
         // A prompt that arrived on the phone isn't terminal news: don't echo the owner's own words.
         const text = stripChannelWrapper(line.text);
-        if (text === st.lastInjected) return;
+        // One injection swallows one echo, no more: the match is consumed (Ruling 15).
+        if (text === st.lastInjected) { st.lastInjected = undefined; return; }
         st.gateOpen = true;
         await this.post(row.group_id, row.topic_id, replyText(text), { shape: (p) => MIRROR_MARK + p, before: async () => { await this.mirrorPace(rowId, false); } });
         return;
@@ -510,7 +511,8 @@ export class DeskRouter {
         const now = Date.now();
         if (now - st.lastHistoryAt >= HISTORY_COOLDOWN_MS) {
           st.lastHistoryAt = now;
-          await this.post(row.group_id, row.topic_id, HISTORY_MARK + "Recent chat:\n\n" + line.text);
+          // Transcript text gets the same control-char/invisible scrub as every other reply (Ruling 14).
+          await this.post(row.group_id, row.topic_id, replyText(HISTORY_MARK + "Recent chat:\n\n" + line.text));
         }
         return;
       }

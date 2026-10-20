@@ -533,6 +533,9 @@ describe("daemon chat mirror", () => {
     const n = tg.sent.length;
     await mirrorSocket(socketPath, mirror({ kind: "user_prompt", text: '<channel source="teledesk" message_id="1">hello</channel>' }));
     expect(tg.sent.length).toBe(n);
+    // The match was consumed by that one echo: a later terminal-typed prompt of the same text posts.
+    await mirrorSocket(socketPath, mirror({ kind: "user_prompt", text: "hello" }));
+    await until(() => tg.inTopic(d.topic).includes("🧑 hello"));
   });
 
   it("an assistant line posts with the reply mark, chunked", async () => {
@@ -578,6 +581,15 @@ describe("daemon chat mirror", () => {
     await mirrorSocket(socketPath, mirror({ kind: "history", text: "and again" }));
     expect(tg.inTopic(d.topic).filter((t) => t.startsWith("📜 ")).length).toBe(1);
     expect(tg.inTopic(d.topic)[1]).toBe("📜 Recent chat:\n\nthe earlier chat");
+  });
+
+  it("history text gets the reply scrub", async () => {
+    const { tg, socketPath, open } = await deskSetup();
+    const d = await open("/w/proj", 11, TOKEN);
+    // \u0007 (bell, a control char) and ​ (zero-width space, invisible) come out of transcripts.
+    await mirrorSocket(socketPath, mirror({ kind: "history", text: "one\u0007two​ three" }));
+    await until(() => tg.inTopic(d.topic).some((t) => t.startsWith("📜 ")));
+    expect(tg.inTopic(d.topic).find((t) => t.startsWith("📜 "))).toBe("📜 Recent chat:\n\none two three");
   });
 
   it("over budget, chat waits but never drops", async () => {
