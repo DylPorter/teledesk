@@ -19,9 +19,9 @@ Rig notes / deviations from the brief's literal rig (all deliberate):
 - Hooked events: the brief's four (`UserPromptSubmit`, `PreToolUse` matcher `*`, `PostToolUse` matcher `*`, `Stop`) **plus `SubagentStop`** — needed because question (b) asks whether a Stop-like event fires for the subagent.
 - `PreToolUse` second entry varied per run: runs A/B used the brief's `(sleep 30; echo survived >> …/log.jsonl) </dev/null >/dev/null 2>&1 & exit 0`; run CF replaced it with a timestamped `sleep 60` variant writing `c-timeline.txt`, plus a third entry `{ cat >/dev/null; echo FHOOK_START …; sleep 5; echo FHOOK_END …; }` for (f). Run D used the CF settings unchanged.
 
-Probes (d)-for-`desk_on` and (e) need a live desk session + Dylan's phone; owner asleep → see those sections: UNVERIFIED, defaults kept (ledger Ruling 2). No Telegram/teledesk/daemon surface was touched by any probe.
+Probes (d)-for-`desk_on` and (e) need a live desk session + the owner's phone; owner asleep → see those sections: UNVERIFIED, defaults kept (ledger Ruling 2). No Telegram/teledesk/daemon surface was touched by any probe.
 
-Redaction: `/home/tdporter` → `~`; UUIDs/agent ids truncated after 8 chars with `…`. No credential-shaped values ever appear in hook payloads.
+Redaction: `/home/<user>` → `~`; UUIDs/agent ids truncated after 8 chars with `…`. No credential-shaped values ever appear in hook payloads.
 
 ## (a) Hook JSON shapes — VERIFIED (default holds)
 
@@ -63,6 +63,14 @@ Facts downstream implementers should code against, beyond the defaults:
 ## (b) Subagent tool calls fire parent hooks with the parent session_id — VERIFIED (default holds)
 
 Run B: parent asked to spawn a `general-purpose` subagent running `echo sub`. Appended event order: `UserPromptSubmit` → `PreToolUse(Agent)` → `PreToolUse(Bash, agent)` → `PostToolUse(Bash, agent)` → `SubagentStop` → `PostToolUse(Agent)` → `Stop`.
+
+- **The subagent-spawn tool's observed `tool_name` is `Agent`, NOT `Task`** (CC 2.1.304; the plan brief's "Task-subagent" wording is wrong for this build). The parent's spawn call, redacted:
+
+```json
+{"…":"common fields","hook_event_name":"PreToolUse","tool_name":"Agent","tool_input":{"description":"Run echo sub","prompt":"Run this exact bash command and nothing else: echo sub. Then reply with only the word done.","subagent_type":"general-purpose","run_in_background":false},"tool_use_id":"toolu_bbda…"}
+```
+
+  A matcher authored against `Task` silently misses every subagent spawn.
 
 - **Pre/PostToolUse DO fire for the subagent's `Bash` call**, carrying `agent_id` and `agent_type` alongside the parent fields.
 - **`session_id` is identical to the parent's** — one unique value across all run-B events: `5a4ff1ab-…`. The subagent's own id is `aeb5ca0c…` (`agent_id`); its transcript nests under the parent session:
@@ -110,7 +118,7 @@ Caveats for the mirror: the child survives but is orphaned/reparented — it has
 {"…":"common","hook_event_name":"PostToolUse","tool_name":"mcp__cloak-search__search_web","tool_input":{"query":"hook test","engine":"duckduckgo"},"tool_response":[{"type":"text","text":"Search Results (Engine: DuckDuckGo)\n\n[Result 1]\nTitle: …"}],"duration_ms":3049}
 ```
 
-**UNVERIFIED specifically for `mcp__teledesk__desk_on`:** that requires a real desk session (plus Dylan's phone for the `/desk` turn); per Ruling 2 the probe was skipped — no Telegram, no daemon, no `/desk`, no `~/.local/share/teledesk` touched. There is no structural reason desk-on would differ (same hook engine, same name form), but no observed `desk_on` payload exists in this record.
+**UNVERIFIED specifically for `mcp__teledesk__desk_on`:** that requires a real desk session (plus the owner's phone for the `/desk` turn); per Ruling 2 the probe was skipped — no Telegram, no daemon, no `/desk`, no `~/.local/share/teledesk` touched. There is no structural reason desk-on would differ (same hook engine, same name form), but no observed `desk_on` payload exists in this record.
 
 **Verdict:** keep the plan default ("fires") → the 📜 capped snapshot may ride a `PostToolUse` matcher `mcp__teledesk__desk_on`. **Contingent fallback (plan, unchanged):** if field-testing after wake shows it doesn't fire, ship the history kind dormant (protocol stays, no trigger), record `/desk` as forward-only — and do NOT move extraction daemon-side (no transcript access there).
 
@@ -118,7 +126,7 @@ Implementer note from run D: this harness deferred MCP tools behind a `ToolSearc
 
 ## (e) UserPromptSubmit for channel-injected (phone) messages — UNVERIFIED (default kept)
 
-Needs a live desk topic + a message from Dylan's phone; owner asleep, and simulating by *typing* wrapper-shaped text proves nothing about the injection path. Per Ruling 2: no probe run.
+Needs a live desk topic + a message from the owner's phone; owner asleep, and simulating by *typing* wrapper-shaped text proves nothing about the injection path. Per Ruling 2: no probe run.
 
 **Verdict:** keep the plan default — **fires, text wrapped in `<channel source="teledesk" message_id="…">…</channel>`** (the wrapper form is what the desk daemon passes; Task 5's `stripChannelWrapper` is built for it). **Contingent fallback (plan, unchanged):** if it turns out not to fire for injected messages, Task 7's dedupe simply stays a harmless no-op. Nothing else in the plan depends on (e).
 
@@ -142,9 +150,10 @@ The tool ran **5.26 s after the hook event and 0.22 s after the slow hook exited
 
 ## Consequences for later tasks (one line each)
 
+- **Matcher names (all tasks):** on CC 2.1.304 the subagent tool fires as `tool_name:"Agent"`, not `Task` (see (b) for the raw excerpt) — matchers must use the observed name or `*`, never the brief's `Task`.
 - **T5/6 `HookInput`:** code against the field lists in (a); `tool_response` union-typed (Bash object / Read `{type,file}` / MCP array); `prompt_id` available for turn keys; ignore `_*` fields (rig artifact).
 - **T7 binding:** parent-`session_id` rule as planned (b); no nested-accept flip; `agent_id`/`agent_type` mark subagent-origin lines.
 - **T8 installer detach:** `cmd & exit 0` survives (c); the CLI-respawn fallback stays unexecuted.
 - **T9 hooks set:** four events + `SubagentStop` exist and fire; MCP matcher `mcp__teledesk__desk_on` structurally works (d) — field-confirm on desk wake before wiring the snapshot to it, else history dormant.
 - **Latency budget (all):** PreToolUse blocks tools (f) → mirror sends are async-only.
-- **Open items to field-verify with Dylan awake:** (d) actual `desk_on` event, (e) injected-message `UserPromptSubmit`.
+- **Open items to field-verify with the owner awake:** (d) actual `desk_on` event, (e) injected-message `UserPromptSubmit`.
