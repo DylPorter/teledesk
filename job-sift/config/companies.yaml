@@ -25,6 +25,7 @@ greenhouse:
   - pinterest       # Pinterest — consumer tech
 
 lever:
+  - binance         # Binance — AI Agent / Harness roles and BAP internships
   - mistral         # Mistral AI — open-weights frontier lab
   - plaid           # Plaid — fintech infra
   - spotify         # Spotify
